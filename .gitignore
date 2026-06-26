@@ -1,0 +1,121 @@
+# --- Environment & Credentials ---
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.env
+*.pem
+*.key
+*.cert
+*.pfx
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Python Virtual Environments ---
+.venv/
+venv/
+ENV/
+env/
+active_env/
+conda-meta/
+
+# --- Python Testing & Coverage ---
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# --- Jupyter Notebook ---
+.ipynb_checkpoints
+
+# --- Celery & Redis ---
+celerybeat-schedule
+celerybeat.pid
+
+# --- Node / Frontend (Next.js) ---
+node_modules/
+.next/
+out/
+build/
+dist/
+.npm
+.yarn-integrity
+yarn-error.log
+yarn-debug.log*
+npm-debug.log*
+eslintcache
+.eslintcache
+*.tsbuildinfo
+
+# --- OS Specific ---
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# --- IDEs and Editors ---
+.idea/
+.vscode/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+.project
+
+# --- Databases & Vector DBs (Local Storage) ---
+# Ignore local db/vector storage if stored in workspace root
+/data/
+/pgdata/
+/neo4j_data/
+/qdrant_storage/
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Project Specific Runtime Paths ---
+/uploads/*
+!/uploads/.gitkeep
+/logs/
+*.log
+
+# --- Antigravity Scratch Files ---
+.gemini/
+/scratch/
