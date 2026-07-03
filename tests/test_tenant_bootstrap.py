@@ -12,17 +12,23 @@ from backend.app import app
 class TestTenantBootstrap(unittest.TestCase):
     def setUp(self):
         self.db = SessionLocal()
+        from backend.config import get_settings
+        self.settings = get_settings()
+        self.original_tenant_id = self.settings.DEFAULT_TENANT_ID
+        self.settings.DEFAULT_TENANT_ID = "test_bootstrap_tenant"
+        
         # Clean up existing test records to avoid conflicts
         self.db.query(User).filter(User.username == "bootstrap_user").delete()
-        self.db.query(Tenant).filter(Tenant.id == "default").delete()
+        self.db.query(Tenant).filter(Tenant.id == "test_bootstrap_tenant").delete()
         self.db.commit()
         self.client = TestClient(app)
 
     def tearDown(self):
         # Clean up after tests
         self.db.query(User).filter(User.username == "bootstrap_user").delete()
-        self.db.query(Tenant).filter(Tenant.id == "default").delete()
+        self.db.query(Tenant).filter(Tenant.id == "test_bootstrap_tenant").delete()
         self.db.commit()
+        self.settings.DEFAULT_TENANT_ID = self.original_tenant_id
         self.db.close()
 
     def test_fresh_db_startup_creates_default_tenant(self):
@@ -52,7 +58,7 @@ class TestTenantBootstrap(unittest.TestCase):
         # Verify user row was created and references the default tenant
         user = self.db.query(User).filter(User.username == "bootstrap_user").first()
         self.assertIsNotNone(user)
-        self.assertEqual(user.tenant_id, "default")
+        self.assertEqual(user.tenant_id, self.settings.DEFAULT_TENANT_ID)
 
 if __name__ == '__main__':
     unittest.main()

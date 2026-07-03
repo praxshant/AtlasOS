@@ -19,6 +19,10 @@ celery_app = Celery(
     include=["backend.tasks.ingestion_tasks"]
 )
 
+import os
+
+is_windows = os.name == 'nt'
+
 celery_app.conf.update(
     task_serializer='json',
     accept_content=['json'],
@@ -27,9 +31,10 @@ celery_app.conf.update(
     enable_utc=True,
     task_track_started=True,
     task_time_limit=3600,
-    worker_concurrency=4,
+    worker_concurrency=1 if is_windows else 4,
     worker_prefetch_multiplier=1,
-    broker_connection_retry_on_startup=True
+    broker_connection_retry_on_startup=True,
+    worker_pool='solo' if is_windows else 'prefork'
 )
 
 import logging
@@ -37,10 +42,4 @@ from celery.signals import worker_process_init
 
 logger = logging.getLogger(__name__)
 
-@worker_process_init.connect
-def init_worker(**kwargs):
-    logger.info("Initializing worker process: pre-loading embedding model...")
-    from backend.vector.qdrant_client import qdrant_client
-    qdrant_client._load_embed_model()
-    logger.info("Embedding model pre-loaded successfully.")
-
+# Eager model loading removed in favor of lazy loading with thread lock

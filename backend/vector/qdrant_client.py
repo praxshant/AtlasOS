@@ -14,12 +14,15 @@ from backend.utils.metrics import record_latency
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+import threading
+
 class QdrantClientWrapper:
     def __init__(self):
         self.url = settings.QDRANT_URL
         self._client = None
         self._embed_model = None
         self._vector_size = None
+        self._lock = threading.Lock()
         self._connect()
 
     def _connect(self):
@@ -32,15 +35,17 @@ class QdrantClientWrapper:
 
     def _load_embed_model(self):
         if not self._embed_model:
-            try:
-                logger.info(f"Loading embedding model: {settings.EMBEDDING_MODEL_NAME}...")
-                self._embed_model = SentenceTransformer(settings.EMBEDDING_MODEL_NAME)
-                self._vector_size = self._embed_model.get_sentence_embedding_dimension()
-                logger.info(f"Embedding model loaded. Dimension: {self._vector_size}")
-            except Exception as e:
-                logger.error(f"Failed to load sentence-transformers model: {e}")
-                # Fallback dimension for all-MiniLM-L6-v2 is 384
-                self._vector_size = 384
+            with self._lock:
+                if not self._embed_model:
+                    try:
+                        logger.info(f"Loading embedding model: {settings.EMBEDDING_MODEL_NAME}...")
+                        self._embed_model = SentenceTransformer(settings.EMBEDDING_MODEL_NAME)
+                        self._vector_size = self._embed_model.get_sentence_embedding_dimension()
+                        logger.info(f"Embedding model loaded. Dimension: {self._vector_size}")
+                    except Exception as e:
+                        logger.error(f"Failed to load sentence-transformers model: {e}")
+                        # Fallback dimension for all-MiniLM-L6-v2 is 384
+                        self._vector_size = 384
 
     def get_client(self) -> QdrantClient:
         if not self._client:
@@ -58,8 +63,18 @@ class QdrantClientWrapper:
             collections = client.get_collections().collections
             exists = any(c.name == collection_name for c in collections)
             
+            if exists:
+                try:
+                    info = client.get_collection(collection_name)
+                    if info.config.params.vectors.size != self._vector_size:
+                        logger.warning("Vector size mismatch. Recreating collection. Re-ingest documents.")
+                        client.delete_collection(collection_name)
+                        exists = False
+                except Exception as e:
+                    logger.error(f"Error checking collection config for {collection_name}: {e}")
+            
             if not exists:
-                logger.info(f"Creating Qdrant collection: {collection_name}...")
+                logger.info(f"Creating Qdrant collection: {collection_name} with size {self._vector_size}...")
                 client.create_collection(
                     collection_name=collection_name,
                     vectors_config=VectorParams(size=self._vector_size, distance=Distance.COSINE),

@@ -83,9 +83,10 @@ class ProcessingJob(Base):
 
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
-    document_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    document_id = Column(Integer, ForeignKey("documents.id", ondelete="SET NULL"), nullable=True)
     status = Column(String, default="pending") # pending, processing, completed, failed
     error = Column(Text, nullable=True)
+    details = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -115,6 +116,7 @@ class Entity(Base):
     __table_args__ = (
         Index('ix_entities_tenant_name', 'tenant_id', 'canonical_name'),
         Index('ix_entities_tenant_type', 'tenant_id', 'entity_type'),
+        Index('ix_entities_canonical_name', 'canonical_name'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -137,6 +139,8 @@ class AuditLog(Base):
     id = Column(Integer, primary_key=True, index=True)
     tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    actor_type = Column(String, default="USER") # USER, SYSTEM, WORKER, API
+    actor_name = Column(String, nullable=True)
     action = Column(String, nullable=False) # e.g. query_copilot, run_rca, upload_document
     query_text = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=datetime.utcnow)
@@ -175,6 +179,34 @@ def init_db():
     # Attempt to create tables (will not overwrite if they exist)
     Base.metadata.create_all(bind=engine)
     ensure_default_tenant()
+    
+    try:
+        from sqlalchemy import text
+        import logging
+        logger = logging.getLogger(__name__)
+        with engine.connect() as conn:
+            conn.execute(text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uix_entity_canonical_tenant "
+                "ON entities (canonical_name, tenant_id, entity_type)"
+            ))
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"Index creation warning (may already exist): {e}")
+
+def get_document_risk_metadata(doc_id: int, db_session) -> dict:
+    """Retrieve risk signal metadata stored in job.details for a document."""
+    import json
+    job = db_session.query(ProcessingJob).filter(
+        ProcessingJob.document_id == doc_id,
+        ProcessingJob.status == "completed"
+    ).order_by(ProcessingJob.updated_at.desc()).first()
+    
+    if job and job.details:
+        try:
+            return json.loads(job.details)
+        except json.JSONDecodeError:
+            return {}
+    return {}
 
 def get_db():
     db = SessionLocal()

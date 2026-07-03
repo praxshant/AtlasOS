@@ -68,5 +68,45 @@ class ProgressTracker:
         if raw:
             return json.loads(raw)
         return {"status": "unknown"}
+        
+    def update_progress_with_metadata(self, job_id: str, stage: str, percent: int, metadata: dict = None, redis_client=None):
+        """Enhanced progress update that stores additional metadata per stage."""
+        import time
+        self.update_stage(job_id, stage, percent)
+        
+        client = redis_client or self.redis
+        if metadata and client:
+            meta_key = f"atlasos:job_meta:{job_id}"
+            client.setex(
+                meta_key,
+                86400,
+                json.dumps({
+                    "stage": stage,
+                    "metadata": metadata,
+                    "updated_at": time.time()
+                })
+            )
+            
+    def get_progress_with_metadata(self, job_id: str, redis_client=None) -> dict:
+        """Return combined progress + metadata."""
+        progress = self.get_progress(job_id)
+        if progress.get("status") == "unknown":
+            return progress
+            
+        client = redis_client or self.redis
+        meta_key = f"atlasos:job_meta:{job_id}"
+        meta_raw = client.get(meta_key)
+        
+        progress["stage_metadata"] = {}
+        if meta_raw:
+            try:
+                meta_data = json.loads(meta_raw)
+                # Ensure metadata is for current stage (or just attach it)
+                if meta_data.get("stage") == progress.get("stage"):
+                    progress["stage_metadata"] = meta_data.get("metadata", {})
+            except Exception:
+                pass
+                
+        return progress
 
 progress_tracker = ProgressTracker()

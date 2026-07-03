@@ -7,7 +7,7 @@ os.environ["OPENROUTER_API_KEY"] = "test_key"
 os.environ["NEO4J_URI"] = "bolt://localhost:7687"
 os.environ["QDRANT_URL"] = "http://localhost:6333"
 
-from backend.db.postgres import SessionLocal, Tenant, User, Document, Chunk, Entity
+from backend.db.postgres import SessionLocal, Tenant, User, Document, Chunk, Entity, ProcessingJob
 from backend.graph.neo4j_client import neo4j_client
 from backend.vector.qdrant_client import qdrant_client
 
@@ -15,22 +15,24 @@ def test_tenant_isolation_postgres():
     # Verify that we can't fetch tenant B's data when querying with tenant A
     db = SessionLocal()
     
-    # Clean up old
-    db.query(Entity).delete()
-    db.query(Document).delete()
-    db.query(User).delete()
-    db.query(Tenant).delete()
+    # Clean up t1 and t2 only to avoid foreign key violations on other tenants (like default)
+    db.query(ProcessingJob).filter(ProcessingJob.tenant_id.in_(["t1", "t2"])).delete(synchronize_session=False)
+    db.query(Chunk).filter(Chunk.tenant_id.in_(["t1", "t2"])).delete(synchronize_session=False)
+    db.query(Entity).filter(Entity.tenant_id.in_(["t1", "t2"])).delete(synchronize_session=False)
+    db.query(Document).filter(Document.tenant_id.in_(["t1", "t2"])).delete(synchronize_session=False)
+    db.query(User).filter(User.tenant_id.in_(["t1", "t2"])).delete(synchronize_session=False)
+    db.query(Tenant).filter(Tenant.id.in_(["t1", "t2"])).delete(synchronize_session=False)
     
     # Create tenants
-    t1 = Tenant(id="t1", name="Tenant 1")
-    t2 = Tenant(id="t2", name="Tenant 2")
+    t1 = Tenant(id="t1", name="Tenant 1", slug="t1")
+    t2 = Tenant(id="t2", name="Tenant 2", slug="t2")
     db.add(t1)
     db.add(t2)
     db.commit()
     
     # Create docs
-    d1 = Document(tenant_id="t1", filename="doc1.pdf", file_path="doc1.pdf", status="completed")
-    d2 = Document(tenant_id="t2", filename="doc2.pdf", file_path="doc2.pdf", status="completed")
+    d1 = Document(tenant_id="t1", filename="doc1.pdf", file_path="doc1.pdf", file_type="PDF", status="completed")
+    d2 = Document(tenant_id="t2", filename="doc2.pdf", file_path="doc2.pdf", file_type="PDF", status="completed")
     db.add(d1)
     db.add(d2)
     db.commit()

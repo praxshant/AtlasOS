@@ -19,7 +19,23 @@ class RCAState(TypedDict):
     relevant_procedures: List[Dict[str, Any]]
     report: Dict[str, Any]
 
-# 2. Node Functions
+# 2. Helper Functions
+def summarize_subgraph_for_prompt(nodes: List[Dict[str, Any]], edges: List[Dict[str, Any]]) -> str:
+    """Summarizes a multi-hop subgraph into text for the LLM."""
+    if not nodes and not edges:
+        return "No graph context available."
+    
+    summary = "Knowledge Graph Nodes:\n"
+    for n in nodes:
+        props = ", ".join([f"{k}: {v}" for k, v in n.items() if k not in ["name", "label", "score"]])
+        summary += f"- {n.get('name')} ({n.get('label')}) [{props}]\n"
+        
+    summary += "\nKnowledge Graph Relationships:\n"
+    for e in edges:
+        summary += f"- {e.get('source')} -[{e.get('type')}]-> {e.get('target')}\n"
+    return summary
+
+# 3. Node Functions
 
 def parsing_node(state: RCAState) -> Dict[str, Any]:
     """
@@ -59,8 +75,14 @@ def retrieve_incidents_node(state: RCAState) -> Dict[str, Any]:
     tenant_id = state.get("tenant_id")
     logger.info("[RCA Agent] Retrieving similar incidents from Qdrant...")
     try:
-        similar = qdrant_client.similarity_search("document_chunks", desc, top_k=3, tenant_id=tenant_id)
-        return {"similar_incidents": similar}
+        # Fetch more to allow post-filtering by section_type
+        all_chunks = qdrant_client.similarity_search("document_chunks", desc, top_k=15, tenant_id=tenant_id)
+        similar = []
+        for chunk in all_chunks:
+            sec_type = chunk.get("metadata", {}).get("section_type", "general")
+            if sec_type in ["work_order", "incident_report", "failure_analysis", "rca", "general"]:
+                similar.append(chunk)
+        return {"similar_incidents": similar[:3]}
     except Exception as e:
         logger.error(f"Failed retrieving similar incidents: {e}")
         return {"similar_incidents": []}
@@ -72,26 +94,17 @@ def retrieve_history_node(state: RCAState) -> Dict[str, Any]:
     parsed = state["parsed_incident"]
     tenant_id = state.get("tenant_id")
     asset_name = parsed.get("asset", "Unknown")
-    logger.info(f"[RCA Agent] Querying maintenance logs for {asset_name} in Neo4j...")
+    logger.info(f"[RCA Agent] Querying multihop subgraph for {asset_name} in Neo4j...")
     
-    history = []
+    history_str = "No graph context available."
     if asset_name and asset_name != "Unknown":
         try:
-            tenant_filter = "AND a.tenant_id = $tenant_id" if tenant_id else ""
-            query = f"""
-            MATCH (a {{name: $asset_name}})-[r]-(m)
-            WHERE true {tenant_filter}
-            RETURN m.name as entity, labels(m)[0] as type, type(r) as relationship
-            LIMIT 15
-            """
-            params = {"asset_name": asset_name}
-            if tenant_id:
-                params["tenant_id"] = tenant_id
-            history = neo4j_client.run_query(query, params)
-            logger.info(f"[RCA Agent] Found {len(history)} related records in Neo4j.")
+            subgraph = neo4j_client.get_multihop_subgraph(start_names=[asset_name], max_depth=2, limit=200, tenant_id=tenant_id)
+            history_str = summarize_subgraph_for_prompt(subgraph.get("nodes", []), subgraph.get("edges", []))
+            logger.info(f"[RCA Agent] Extracted multihop graph history for {asset_name}.")
         except Exception as e:
-            logger.error(f"Failed Neo4j history lookup: {e}")
-    return {"maintenance_history": history}
+            logger.error(f"Failed Neo4j multihop lookup: {e}")
+    return {"maintenance_history": [{"history_str": history_str}]}
 
 def retrieve_procedures_node(state: RCAState) -> Dict[str, Any]:
     """
@@ -165,16 +178,16 @@ def synthesis_node(state: RCAState) -> Dict[str, Any]:
     for idx, item in enumerate(similar):
         evidence_str += f"- [{idx + 1}] {item.get('text')} (Doc: {item.get('metadata', {}).get('source_file')})\n"
         
-    evidence_str += "\nAsset Operations History (from Graph):\n"
-    for item in history:
-        evidence_str += f"- Connected node: {item['entity']} ({item['type']}) via relationship {item['relationship']}\n"
+    history_str = history[0].get("history_str", "No graph context available.") if history else "No graph context available."
+    
+    evidence_str += f"\nAsset Operations History (from Graph):\n{history_str}\n"
         
     evidence_str += "\nSafety Procedures & Regulations:\n"
     for p in procedures:
         evidence_str += f"- {p.get('name')}: {p.get('description', p.get('requirement', ''))}\n"
         
     prompt = f"""
-    You are a principal Reliability & Process Safety Engineer. Perform a Root Cause Analysis (RCA) on the following incident.
+    You are a principal Reliability & Process Safety Engineer. Perform a Root Cause Analysis (RCA) on the following incident using a 5-Why fault tree methodology.
     
     Incident:
     "{desc}"
@@ -182,29 +195,25 @@ def synthesis_node(state: RCAState) -> Dict[str, Any]:
     Evidence collected:
     {evidence_str}
     
-    Your task is to analyze this data and generate a JSON Root Cause Analysis report matching this schema:
+    Your task is to analyze this data and generate a JSON Root Cause Analysis report matching exactly this schema:
     {{
-      "summary": "High-level summary of the incident, direct cause, and recommendations.",
-      "probable_causes": [
-        {{
-          "cause": "Specific failure or physical mechanism",
-          "confidence": 0.85,
-          "evidence_refs": ["Ref to similar incident or history log"]
-        }}
+      "mode": "rca",
+      "incident_title": "Short title of the incident",
+      "primary_cause": "The main technical root cause",
+      "fault_tree": [
+        "Why 1: [Observation]",
+        "Why 2: [Immediate Cause]",
+        "Why 3: [Underlying Mechanism]",
+        "Why 4: [Systemic Issue]",
+        "Why 5: [Root Cause]"
       ],
-      "cause_tree": {{
-        "name": "Incident Name",
-        "children": [
-          {{
-            "name": "Direct Cause",
-            "children": [
-              {{ "name": "Contributing Factor" }},
-              {{ "name": "Root Cause" }}
-            ]
-          }}
-        ]
-      }},
-      "confidence_score": 0.75
+      "contributing_factors": ["Factor 1", "Factor 2"],
+      "corrective_actions": [
+        "Action 1",
+        "Action 2"
+      ],
+      "knowledge_gaps": ["Missing SOP for X", "No maintenance record for Y"],
+      "similar_incidents_count": {len(similar)}
     }}
     
     Return the response strictly as a JSON block. Avoid any conversational text or markdown wrappers.
@@ -216,16 +225,37 @@ def synthesis_node(state: RCAState) -> Dict[str, Any]:
         cited_docs = list(set([item.get('metadata', {}).get('source_file') for item in similar if item.get('metadata', {}).get('source_file')]))
         report_data["cited_docs"] = cited_docs
         
+        # Post-process: Add knowledge gaps back to Graph
+        asset_name = parsed.get("asset", "Unknown")
+        gaps = report_data.get("knowledge_gaps", [])
+        if asset_name != "Unknown" and gaps:
+            tenant_id = state.get("tenant_id", "default")
+            logger.info(f"[RCA Agent] Inserting knowledge gaps for {asset_name} into KG...")
+            for gap in gaps:
+                q = """
+                MATCH (a {name: $asset_name})
+                WHERE a.tenant_id = $tenant_id
+                MERGE (g:KnowledgeGap {name: $gap, tenant_id: $tenant_id})
+                MERGE (a)-[:HAS_KNOWLEDGE_GAP]->(g)
+                """
+                try:
+                    neo4j_client.run_query(q, {"asset_name": asset_name, "gap": gap, "tenant_id": tenant_id})
+                except Exception as e:
+                    logger.warning(f"Failed to insert knowledge gap {gap}: {e}")
+
         return {"report": report_data}
     except Exception as e:
         logger.error(f"Failed to synthesize RCA report: {e}")
         # Return fallback report structure
         fallback = {
-            "summary": f"Failed to run automated RCA due to error: {e}. Standard inspection of asset {parsed.get('asset')} recommended.",
-            "probable_causes": [{"cause": "Unresolved engine error", "confidence": 0.5, "evidence_refs": []}],
-            "cause_tree": {"name": "Incident", "children": [{"name": f"Asset: {parsed.get('asset')}"}, {"name": f"Failure: {parsed.get('failure_mode')}"}]},
-            "confidence_score": 0.2,
-            "cited_docs": []
+            "mode": "rca",
+            "incident_title": f"Incident Analysis: {parsed.get('asset', 'Unknown Asset')}",
+            "primary_cause": f"Analysis failed: {str(e)}",
+            "fault_tree": [],
+            "contributing_factors": [],
+            "corrective_actions": ["Manually review incident logs", "Verify API connectivity"],
+            "knowledge_gaps": [],
+            "similar_incidents_count": len(similar)
         }
         return {"report": fallback}
 

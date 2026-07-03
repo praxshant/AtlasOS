@@ -430,6 +430,127 @@ class Neo4jClient:
         "LessonLearned": "SOP",
     }
 
+    def compute_knowledge_coverage_score(self, equipment_name: str, tenant_id: str = None) -> Dict[str, Any]:
+        """Advanced weighted coverage scoring for one asset."""
+        tid = tenant_id or "default"
+        
+        q1 = "MATCH (a {name: $name, tenant_id: $tid})-[:PREVENTS|COMPLIES_WITH]-(p:Procedure) RETURN count(p) > 0 AS has_sop"
+        q2 = "MATCH (a {name: $name, tenant_id: $tid})<-[:OCCURRED_ON]-(i:Incident) RETURN count(i) AS incident_count"
+        q3 = "MATCH (a {name: $name, tenant_id: $tid})<-[:PERFORMED_ON|MAINTAINED_BY]-(m) RETURN count(m) AS maintenance_count"
+        q4 = "MATCH (a {name: $name, tenant_id: $tid})-[:COMPLIES_WITH]->(r:Regulation) RETURN count(r) > 0 AS has_compliance"
+        q5 = "MATCH (a {name: $name, tenant_id: $tid})<-[:KNOWLEDGE_OWNER_FOR|MAINTAINED_BY]-(p:Person) RETURN count(p) > 0 AS has_expert, collect(p.name) AS experts"
+        
+        params = {"name": equipment_name, "tid": tid}
+        
+        res1 = self.run_query(q1, params)
+        has_sop = res1[0]["has_sop"] if res1 else False
+        
+        res2 = self.run_query(q2, params)
+        has_incident_history = (res2[0]["incident_count"] > 0) if res2 else False
+        
+        res3 = self.run_query(q3, params)
+        has_maintenance = (res3[0]["maintenance_count"] > 0) if res3 else False
+        
+        res4 = self.run_query(q4, params)
+        has_compliance = res4[0]["has_compliance"] if res4 else False
+        
+        res5 = self.run_query(q5, params)
+        has_expert = res5[0]["has_expert"] if res5 else False
+        experts = res5[0]["experts"] if res5 else []
+        
+        score = int((
+            0.25 * int(has_sop) +
+            0.20 * int(has_incident_history) +
+            0.20 * int(has_maintenance) +
+            0.20 * int(has_compliance) +
+            0.15 * int(has_expert)
+        ) * 100)
+        
+        missing = [cat for cat, present in zip(
+            ["SOP", "Incident History", "Maintenance", "Compliance", "Expert Owner"],
+            [has_sop, has_incident_history, has_maintenance, has_compliance, has_expert]
+        ) if not present]
+        
+        return {
+            "equipment": equipment_name,
+            "coverage_score": score,
+            "has_sop": has_sop,
+            "has_incident_history": has_incident_history,
+            "has_maintenance": has_maintenance,
+            "has_compliance": has_compliance,
+            "has_expert": has_expert,
+            "experts": experts,
+            "missing_categories": missing
+        }
+
+    def compute_risk_score(self, equipment_name: str, tenant_id: str = None) -> Dict[str, Any]:
+        """Multi-factor explainable risk scoring for one asset."""
+        tid = tenant_id or "default"
+        risk_factors = []
+        risk_score = 0
+        
+        # Factor 1
+        q1 = """
+        MATCH (a {name: $name, tenant_id: $tid})<-[:OCCURRED_ON]-(i:Incident)
+        WHERE toLower(i.name) CONTAINS 'catastrophic' OR toLower(i.name) CONTAINS 'emergency' OR toLower(i.name) CONTAINS 'critical'
+        RETURN count(i) AS severe_incidents
+        """
+        res1 = self.run_query(q1, {"name": equipment_name, "tid": tid})
+        severe_incidents = res1[0]["severe_incidents"] if res1 else 0
+        if severe_incidents > 0:
+            risk_score += 30
+            risk_factors.append("Has documented catastrophic or emergency incident")
+            
+        # Factor 2
+        coverage = self.compute_knowledge_coverage_score(equipment_name, tenant_id)
+        if coverage["coverage_score"] < 50:
+            risk_score += 25
+            risk_factors.append(f"Knowledge coverage is low ({coverage['coverage_score']}%)")
+        elif coverage["coverage_score"] < 75:
+            risk_score += 10
+            
+        # Factor 3
+        q3 = """
+        MATCH (a {name: $name, tenant_id: $tid})<-[:KNOWLEDGE_OWNER_FOR|MAINTAINED_BY]-(p:Person)
+        RETURN count(p) AS expert_count
+        """
+        res3 = self.run_query(q3, {"name": equipment_name, "tid": tid})
+        expert_count = res3[0]["expert_count"] if res3 else 0
+        if expert_count == 1:
+            risk_score += 20
+            risk_factors.append("Only one engineer holds knowledge of this asset")
+        elif expert_count == 0:
+            risk_score += 20
+            risk_factors.append("No engineer is linked as knowledge owner")
+            
+        # Factor 4
+        q4 = """
+        MATCH (a {name: $name, tenant_id: $tid})-[:FEEDS|SUPPLIES|CONNECTED_TO]-(b)
+        WHERE exists((b)<-[:OCCURRED_ON]-(:Incident))
+        RETURN count(b) AS critical_neighbors
+        """
+        res4 = self.run_query(q4, {"name": equipment_name, "tid": tid})
+        critical_neighbors = res4[0]["critical_neighbors"] if res4 else 0
+        if critical_neighbors > 0:
+            risk_score += 15
+            risk_factors.append(f"Connected to {critical_neighbors} asset(s) with incident history")
+            
+        # Factor 5
+        if coverage["has_incident_history"] and not coverage["has_sop"]:
+            risk_score += 10
+            risk_factors.append("Has incident history but no Standard Operating Procedure")
+            
+        risk_score = min(risk_score, 100)
+        risk_level = "Critical" if risk_score >= 70 else "High" if risk_score >= 40 else "Medium" if risk_score >= 20 else "Low"
+        
+        return {
+            "equipment": equipment_name,
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "risk_factors": risk_factors,
+            "coverage": coverage
+        }
+
     def compute_knowledge_gaps(
         self,
         equipment_name: str,
@@ -525,7 +646,7 @@ class Neo4jClient:
     ) -> List[Dict[str, Any]]:
         """
         Returns knowledge gap reports for ALL equipment / asset nodes
-        in the tenant's graph.
+        in the tenant's graph, augmented with risk scores.
         """
         tenant_filter = "WHERE n.tenant_id = $tenant_id" if tenant_id else ""
         query = f"""
@@ -548,11 +669,24 @@ class Neo4jClient:
         for row in rows:
             name = row.get("name")
             if name:
+                asset_dict = {"equipment": name}
+                
+                # Fetch basic gaps using existing logic if needed, but we will overwrite with advanced coverage
                 gap = self.compute_knowledge_gaps(name, tenant_id=tenant_id)
-                results.append(gap)
+                asset_dict["discovered"] = gap["discovered"]
+                asset_dict["missing"] = gap["missing"]
+                
+                coverage_data = self.compute_knowledge_coverage_score(name, tenant_id)
+                asset_dict["coverage_score"] = coverage_data["coverage_score"]
+                asset_dict["missing_categories"] = coverage_data["missing_categories"]
+                
+                risk_data = self.compute_risk_score(name, tenant_id)
+                asset_dict["risk_score"] = risk_data["risk_score"]
+                asset_dict["risk_level"] = risk_data["risk_level"]
+                
+                results.append(asset_dict)
 
-        # Sort by coverage ascending so riskiest appear first
-        results.sort(key=lambda x: x["coverage_pct"])
+        results.sort(key=lambda x: x["risk_score"], reverse=True)
         return results
 
     # -------------------------------------------------------------------
@@ -734,30 +868,149 @@ class Neo4jClient:
             "rationale": rationale
         }
 
+    def compute_engineer_centrality(self, engineer_name: str, tenant_id: str = None) -> Dict[str, Any]:
+        """Graph-centrality-based expertise scoring for one engineer."""
+        tid = tenant_id or "default"
+        
+        q1 = """
+        MATCH (p:Person {name: $name, tenant_id: $tid})-[r]-(n)
+        RETURN count(r) AS degree, count(DISTINCT n) AS unique_connections
+        """
+        res1 = self.run_query(q1, {"name": engineer_name, "tid": tid})
+        degree = res1[0]["degree"] if res1 else 0
+        unique_connections = res1[0]["unique_connections"] if res1 else 0
+        
+        q2 = """
+        MATCH (p:Person {name: $name, tenant_id: $tid})-[:KNOWLEDGE_OWNER_FOR|MAINTAINED_BY]->(a)
+        WHERE exists((a)<-[:OCCURRED_ON]-(:Incident))
+        RETURN count(a) AS critical_asset_count, collect(a.name) AS critical_assets
+        """
+        res2 = self.run_query(q2, {"name": engineer_name, "tid": tid})
+        critical_asset_count = res2[0]["critical_asset_count"] if res2 else 0
+        critical_assets = res2[0]["critical_assets"] if res2 else []
+        
+        q3 = """
+        MATCH (p:Person {name: $name, tenant_id: $tid})-[:KNOWLEDGE_OWNER_FOR|MAINTAINED_BY]->(a)
+        WHERE NOT exists {
+          MATCH (other:Person {tenant_id: $tid})-[:KNOWLEDGE_OWNER_FOR|MAINTAINED_BY]->(a)
+          WHERE other.name <> $name
+        }
+        RETURN count(a) AS sole_owned_assets, collect(a.name) AS sole_assets
+        """
+        res3 = self.run_query(q3, {"name": engineer_name, "tid": tid})
+        sole_owned_assets = res3[0]["sole_owned_assets"] if res3 else 0
+        sole_assets = res3[0]["sole_assets"] if res3 else []
+        
+        expertise_score = min(100, (
+            degree * 2 +
+            critical_asset_count * 10 +
+            sole_owned_assets * 15
+        ))
+        
+        succession_risk = "Critical" if sole_owned_assets >= 3 else \
+                          "High"     if sole_owned_assets >= 1 else \
+                          "Medium"   if critical_asset_count >= 2 else "Low"
+                          
+        return {
+            "engineer": engineer_name,
+            "expertise_score": expertise_score,
+            "degree_centrality": degree,
+            "unique_connections": unique_connections,
+            "critical_asset_count": critical_asset_count,
+            "critical_assets": critical_assets,
+            "sole_owned_assets": sole_owned_assets,
+            "sole_assets": sole_assets,
+            "succession_risk": succession_risk,
+            "risk_reason": f"Sole knowledge owner of {sole_owned_assets} assets" if sole_owned_assets > 0 else "Shared knowledge coverage"
+        }
+
     def get_all_engineers(
         self,
         tenant_id: str = None,
         limit: int = 50
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """
-        Returns the names of all Person nodes in the graph for a given tenant.
+        Returns the names of all Person nodes in the graph for a given tenant,
+        along with their expertise, centrality, succession risk, and connected assets.
         """
-        tenant_filter = "WHERE n.tenant_id = $tenant_id" if tenant_id else ""
-        query = f"""
-        MATCH (n:Person)
-        {tenant_filter}
-        RETURN DISTINCT n.name as name
+        tid = tenant_id or "default"
+        query = """
+        MATCH (p {tenant_id: $tenant_id})
+        WHERE p.type = 'Person' OR 'Person' IN labels(p)
+        WITH p, coalesce(p.name, p.label, p.canonical_name, 'Unknown Engineer') AS person_name
+
+        // Count total relationships (degree) and unique connections
+        OPTIONAL MATCH (p)-[r]-(n)
+        WITH p, person_name, count(distinct r) as degree, count(distinct n) as unique_connections
+
+        // Get all connected assets/equipment
+        OPTIONAL MATCH (p)-[:MAINTAINED_BY|INSPECTED_BY|OPERATED_BY|KNOWLEDGE_OWNER|OWNED_BY|KNOWLEDGE_OWNER_FOR]-(a)
+        WHERE (a:Asset OR a:Equipment) AND a.tenant_id = $tenant_id
+        WITH p, person_name, degree, unique_connections, collect(distinct coalesce(a.name, a.label)) as assets
+
+        // Count critical assets (assets connected to an Incident)
+        OPTIONAL MATCH (p)-[:MAINTAINED_BY|INSPECTED_BY|OPERATED_BY|KNOWLEDGE_OWNER|OWNED_BY|KNOWLEDGE_OWNER_FOR]-(ca)
+        WHERE (ca:Asset OR ca:Equipment) AND ca.tenant_id = $tenant_id
+          AND exists((ca)<-[:OCCURRED_ON]-(:Incident))
+        WITH p, person_name, degree, unique_connections, assets, count(distinct ca) as critical_asset_count
+
+        // Count sole owned assets
+        OPTIONAL MATCH (p)-[:MAINTAINED_BY|INSPECTED_BY|OPERATED_BY|KNOWLEDGE_OWNER|OWNED_BY|KNOWLEDGE_OWNER_FOR]-(sa)
+        WHERE (sa:Asset OR sa:Equipment) AND sa.tenant_id = $tenant_id
+          AND NOT exists((sa)<-[:MAINTAINED_BY|INSPECTED_BY|OPERATED_BY|KNOWLEDGE_OWNER|OWNED_BY|KNOWLEDGE_OWNER_FOR]-(other) WHERE other.tenant_id = $tenant_id AND (other.type = 'Person' OR 'Person' IN labels(other)) AND id(other) <> id(p))
+        WITH p, person_name, degree, unique_connections, assets, critical_asset_count, count(distinct sa) as sole_owned_assets
+
+        RETURN person_name as name, p.role as role, degree, unique_connections, assets, critical_asset_count, sole_owned_assets
         LIMIT $limit
         """
-        params: Dict[str, Any] = {"limit": limit}
-        if tenant_id:
-            params["tenant_id"] = tenant_id
+        params = {"tenant_id": tid, "limit": limit}
+        
         try:
             rows = self.run_query(query, params)
-            return [r["name"] for r in rows if r.get("name")]
         except Exception as e:
             logger.error(f"Failed listing engineers: {e}")
             return []
+            
+        results = []
+        for row in rows:
+            name = row.get("name")
+            if name:
+                degree = row.get("degree", 0)
+                assets = row.get("assets", [])
+                critical_asset_count = row.get("critical_asset_count", 0)
+                sole_owned_assets = row.get("sole_owned_assets", 0)
+                
+                # Compute expertise score (max 100)
+                expertise_score = min(100, (
+                    degree * 2 +
+                    critical_asset_count * 10 +
+                    sole_owned_assets * 15
+                ))
+                
+                # Compute succession risk
+                succession_risk = "Critical" if sole_owned_assets >= 3 else \
+                                  "High"     if sole_owned_assets >= 1 else \
+                                  "Medium"   if critical_asset_count >= 2 else "Low"
+                                  
+                # Normalized centrality (degree / 100.0)
+                centrality = round(degree / 100.0, 3)
+                
+                risk_reason = f"Sole knowledge owner of {sole_owned_assets} assets" if sole_owned_assets > 0 else "Shared knowledge coverage"
+                
+                results.append({
+                    "name": name,
+                    "role": row.get("role") or "Engineer",
+                    "expertise_score": float(expertise_score),
+                    "centrality": centrality,
+                    "succession_risk": succession_risk,
+                    "assets": assets,
+                    "sole_owned_assets": sole_owned_assets,
+                    "critical_asset_count": critical_asset_count,
+                    "risk_reason": risk_reason
+                })
+                
+        results.sort(key=lambda x: x.get("expertise_score", 0), reverse=True)
+        return results
 
 # Singleton instance
 neo4j_client = Neo4jClient()

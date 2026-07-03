@@ -43,24 +43,24 @@ class Settings(BaseSettings):
     DEFAULT_TENANT_ID: str = "default"
 
     # Authentication Settings
-    JWT_SECRET_KEY: str = "atlasos_super_secure_production_secret_key_2026"
+    JWT_SECRET_KEY: str | None = None
     JWT_ALGORITHM: str = "HS256"
     JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440 # 24 hours
 
     @field_validator("JWT_SECRET_KEY")
     @classmethod
-    def check_jwt_secret(cls, v: str) -> str:
-        if v == "atlasos_super_secure_production_secret_key_2026":
-            raise ValueError("JWT_SECRET_KEY must be changed from the default value for production security.")
+    def check_jwt_secret(cls, v: str | None) -> str:
+        if not v:
+            raise ValueError("JWT_SECRET environment variable is required. Set it before starting the server. Generate one with: openssl rand -hex 32")
         return v
 
     # Upload and Security Settings
     ALLOWED_ORIGINS: list[str] = ["http://localhost:3000"]
     MAX_UPLOAD_SIZE_MB: int = 10
-    ALLOWED_UPLOAD_EXTENSIONS: list[str] = [".pdf", ".docx", ".txt", ".log", ".csv", ".json"]
+    ALLOWED_UPLOAD_EXTENSIONS: list[str] = [".pdf", ".docx", ".txt", ".log", ".csv", ".json", ".xlsx", ".xls", ".pptx", ".ppt"]
     
     # Embeddings
-    EMBEDDING_MODEL_NAME: str = "all-MiniLM-L6-v2"
+    EMBEDDING_MODEL_NAME: str = "BAAI/bge-large-en-v1.5"
 
     # File uploads
     UPLOAD_DIR: str = "uploads"
@@ -70,7 +70,7 @@ class Settings(BaseSettings):
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
 
     model_config = SettingsConfigDict(
-        env_file=".env", 
+        env_file=(".env", "../.env", "../../.env"), 
         env_file_encoding="utf-8", 
         extra="ignore"
     )

@@ -6,8 +6,25 @@ from langgraph.graph import StateGraph, END
 from backend.db.postgres import SessionLocal, Document, Chunk, Entity
 from backend.graph.neo4j_client import neo4j_client
 from backend.utils.llm_client import structured_complete
+import re
 
 logger = logging.getLogger(__name__)
+
+REGULATION_REQUIREMENTS = {
+    "OSHA 1910": [
+        {"id": "osha-1", "text": "Must have pressure relief valves installed on all vessels."},
+        {"id": "osha-2", "text": "Requires annual hydrostatic testing."}
+    ],
+    "ISO 13849": [
+        {"id": "iso-1", "text": "Emergency stop buttons must be hardwired."},
+        {"id": "iso-2", "text": "Control systems must fail to a safe state."}
+    ]
+}
+
+def extract_clauses(text: str) -> List[str]:
+    """Extract numbered clauses (e.g. '1.1', 'Section 2') or paragraphs."""
+    clauses = re.split(r'\n(?=\d+\.\d+|\bSection\b)', text)
+    return [c.strip() for c in clauses if len(c.strip()) > 20]
 
 # 1. State Definition
 class ComplianceState(TypedDict):
@@ -119,41 +136,55 @@ def evaluate_compliance_node(state: ComplianceState) -> Dict[str, Any]:
     Uses the LLM to check if the document content meets the regulation requirements.
     """
     text = state["document_text"]
+    scope = state["regulation_scope"]
     regs = state["applicable_regulations"]
     logger.info("[Compliance Agent] Evaluating compliance and identifying gaps...")
     
     if not text:
         return {
             "report": {
+                "compliance_score": 0,
+                "compliant_count": 0,
+                "gap_count": 1,
                 "gaps": [{"regulation": "All", "requirement": "N/A", "finding": "Document is empty or has no text content.", "risk_level": "High", "recommendation": "Check document upload."}],
                 "overall_risk": "High",
                 "cited_docs": []
             }
         }
         
-    regs_str = ""
-    for idx, r in enumerate(regs):
-        regs_str += f"[{idx + 1}] Regulation: {r['name']} (Code: {r.get('code')})\nRequirement: {r['requirement']}\n\n"
+    clauses = extract_clauses(text)
+    
+    requirements = []
+    if scope and scope in REGULATION_REQUIREMENTS:
+        requirements = REGULATION_REQUIREMENTS[scope]
+    else:
+        for reqs in REGULATION_REQUIREMENTS.values():
+            requirements.extend(reqs)
+            
+    for r in regs:
+        requirements.append({"id": r.get("code", "REQ"), "text": r.get("requirement", r.get("description", ""))})
         
     prompt = f"""
-    You are an industrial process safety and compliance auditor. Evaluate the following document text against the listed regulations.
+    You are an industrial process safety and compliance auditor. Evaluate the following document clauses against the listed requirements.
     
-    Document Text:
-    ---
-    {text}
-    ---
+    Requirements:
+    {json.dumps(requirements, indent=2)}
     
-    Applicable Regulations:
-    {regs_str}
+    Document Clauses:
+    {json.dumps(clauses, indent=2)}
     
-    Perform compliance gap detection. For each regulation:
-    1. Check if the document mentions or describes actions/equipment that satisfy the regulation's requirements.
+    Perform compliance gap detection. For each requirement:
+    1. Check if the document clauses satisfy the requirement (using clause-level keyword/semantic match).
     2. Identify any missing process, safety measures, or compliance records (gaps).
     3. Assign a risk level (Low, Medium, High).
     4. Provide specific recommendations to close the gaps.
     
     Generate a JSON report matching this structure:
     {{
+      "compliance_score": 85,
+      "compliant_count": 4,
+      "gap_count": 1,
+      "overall_risk": "Medium",
       "gaps": [
         {{
           "regulation": "Name of regulation",
@@ -162,8 +193,7 @@ def evaluate_compliance_node(state: ComplianceState) -> Dict[str, Any]:
           "risk_level": "High",
           "recommendation": "Clear instruction to fix the gap."
         }}
-      ],
-      "overall_risk": "Medium"
+      ]
     }}
     
     Return the response strictly as JSON. No markdown wrappers.
@@ -175,6 +205,9 @@ def evaluate_compliance_node(state: ComplianceState) -> Dict[str, Any]:
         logger.error(f"Failed to generate compliance report: {e}")
         # Return fallback report
         fallback = {
+            "compliance_score": 0,
+            "compliant_count": 0,
+            "gap_count": 1,
             "gaps": [{"regulation": "Compliance Checker", "requirement": "Automated evaluation", "finding": f"Failed checking compliance: {e}", "risk_level": "Medium", "recommendation": "Conduct manual compliance review."}],
             "overall_risk": "Medium"
         }

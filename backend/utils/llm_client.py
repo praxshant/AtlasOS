@@ -46,7 +46,8 @@ def complete(prompt: str, system_prompt: Optional[str] = None) -> str:
         def _do_complete():
             return openai_client.chat.completions.create(
                 model=settings.OPENROUTER_MODEL,
-                messages=messages
+                messages=messages,
+                max_tokens=1000
             )
             
         response = openrouter_breaker.call(_do_complete)
@@ -60,7 +61,7 @@ def complete(prompt: str, system_prompt: Optional[str] = None) -> str:
         logger.error(f"OpenRouter completion failed: {e}")
         raise e
 
-def structured_complete(prompt: str, system_prompt: Optional[str] = None) -> Dict[str, Any]:
+def structured_complete(prompt: str, system_prompt: Optional[str] = None, max_tokens: int = 2000) -> Dict[str, Any]:
     """
     Structured text completion returning a parsed JSON dictionary.
     """
@@ -79,14 +80,15 @@ def structured_complete(prompt: str, system_prompt: Optional[str] = None) -> Dic
         logger.info("=== USER MESSAGE ===")
         logger.info(prompt)
         
-        def _do_structured_complete():
+        def _do_structured_complete(msgs):
             return openai_client.chat.completions.create(
                 model=settings.OPENROUTER_MODEL,
-                messages=messages,
-                response_format={"type": "json_object"}
+                messages=msgs,
+                response_format={"type": "json_object"},
+                max_tokens=max_tokens
             )
             
-        response = openrouter_breaker.call(_do_structured_complete)
+        response = openrouter_breaker.call(_do_structured_complete, messages)
         
         duration_ms = (time.time() - start_time) * 1000.0
         record_latency("openrouter", duration_ms)
@@ -94,18 +96,71 @@ def structured_complete(prompt: str, system_prompt: Optional[str] = None) -> Dic
             record_token_usage(response.usage.prompt_tokens, response.usage.completion_tokens)
         content = response.choices[0].message.content or "{}"
         
-        # Clean response if wrapped in markdown blocks
-        cleaned = content.strip()
-        if cleaned.startswith("```json"):
-            cleaned = cleaned[7:]
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3]
-        cleaned = cleaned.strip()
+        def parse_content(response_text: str) -> Optional[Dict]:
+            # LAYER 1: Direct JSON parse
+            try:
+                return json.loads(response_text)
+            except json.JSONDecodeError:
+                pass
+                
+            # LAYER 2: Extract JSON block
+            import re
+            json_block = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
+            if json_block:
+                try:
+                    return json.loads(json_block.group(1))
+                except json.JSONDecodeError:
+                    pass
+                    
+            # LAYER 3: Find largest JSON-like object
+            start = response_text.find('{')
+            end = response_text.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(response_text[start:end+1])
+                except json.JSONDecodeError:
+                    pass
+            return None
+
+        result = parse_content(content)
         
-        return json.loads(cleaned)
+        if result is None or len(content) < 50:
+            logger.warning(f"structured_complete parsing failed or empty. Retrying... Raw: {content[:500]}")
+            retry_msgs = messages.copy()
+            retry_msgs[-1]["content"] += "\n\nIMPORTANT: Respond ONLY with valid JSON. No explanation. No markdown. Just the JSON object."
+            response2 = openrouter_breaker.call(_do_structured_complete, retry_msgs)
+            content2 = response2.choices[0].message.content or "{}"
+            result2 = parse_content(content2)
+            if result2 is not None:
+                return result2
+            logger.warning(f"structured_complete retry failed. Raw: {content2[:500]}")
+            return {"error": "parse_failed", "raw": content2[:1000]}
+            
+        return result
     except Exception as e:
         logger.error(f"OpenRouter structured completion failed: {e}")
-        raise e
+        return {"error": "request_failed", "raw": str(e)}
+
+def complete_with_context_limit(prompt: str, system_prompt: Optional[str] = None, max_context_tokens: int = 6000) -> str:
+    """
+    Truncate prompt to stay within context limit.
+    Simple character-based approximation: 1 token ≈ 4 characters.
+    max_chars = max_context_tokens * 4
+    """
+    max_chars = max_context_tokens * 4
+    system_chars = len(system_prompt) if system_prompt else 0
+    prompt_chars = len(prompt)
+    
+    if system_chars + prompt_chars <= max_chars:
+        return prompt
+        
+    allowed_prompt_chars = max_chars - system_chars
+    if allowed_prompt_chars <= 0:
+        return prompt
+        
+    # Truncate earlier context from the front
+    truncated_prompt = "..." + prompt[-(allowed_prompt_chars - 3):]
+    return truncated_prompt
 
 def stream_complete(prompt: str, system_prompt: Optional[str] = None) -> Generator[str, None, None]:
     """
@@ -130,7 +185,8 @@ def stream_complete(prompt: str, system_prompt: Optional[str] = None) -> Generat
             return openai_client.chat.completions.create(
                 model=settings.OPENROUTER_MODEL,
                 messages=messages,
-                stream=True
+                stream=True,
+                max_tokens=1500
             )
             
         response = openrouter_breaker.call(_do_stream_complete)
