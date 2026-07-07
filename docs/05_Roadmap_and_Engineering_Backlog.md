@@ -12,13 +12,13 @@ This matrix evaluates the production readiness of each module in the AtlasOS eco
 | Module | Subsystem | Completion State | Reasoning |
 | :--- | :--- | :--- | :--- |
 | **Authentication** | User Sign-In & Guards | **Production Ready** | Secure cookies, JWT verification, and active router guard mappings are implemented in the React-Vite SPA. |
-| **Ingestion** | PyMuPDF parsing & OCR | **Implemented** | Resolves PDF/DOCX structures and runs Tesseract when raw texts are missing. |
-| **Extraction** | LLM Entity Extractor | **Implemented** | Deduplicates entity abbreviations to canonical forms prior to storing them. |
-| **Knowledge Graph** | Neo4j property models | **Implemented** | Indices, entity constraints, and path expansion are verified and active. |
-| **GraphRAG** | Fusion retrieve pipeline | **Implemented** | Streams tokens, citations, and graph mappings successfully. |
+| **Ingestion** | Document & Tabular Parsers | **Production Ready** | Structure-aware chunking for PDF, DOCX, TXT, LOG. Includes custom natural-language row converters for CSV/XLSX spreadsheets, slide parsers for PPTX, and Tesseract OCR fallbacks. |
+| **Extraction** | LLM Entity Extractor | **Production Ready** | Bulk extraction optimized to one-call LLM queries per document, cached extractions (`CachedExtraction`), deterministic regex matching, and Neo4j bulk upserts. |
+| **Knowledge Graph** | Neo4j property models | **Production Ready** | Unified `:Entity` and `:REL` consolidation allows APOC-free Cypher traversals and unique `canonical_id` indexing per tenant. |
+| **GraphRAG** | Fusion retrieve pipeline | **Production Ready** | Combined BM25 and vector semantic search (Retriever 3.0), PageRank centrality-aware ranking, and shortest path graph expansion context injection. |
 | **RCA** | Ishikawa Cause tree | **Implemented** | Renders dynamic causal chains in UI instead of raw JSON dumps. |
 | **Compliance** | Audit checker page | **Implemented** | Renders Pass/Fail checklist cards with highlighted regulatory non-compliance findings. |
-| **DevOps** | Docker Compose bring-up | **Production Ready** | All dependency databases are fully containerized and restart automatically. |
+| **DevOps** | Docker Compose bring-up | **Production Ready** | All dependency databases are fully containerized and restart automatically. Includes database health verification scripts. |
 
 ---
 
@@ -27,12 +27,10 @@ This matrix evaluates the production readiness of each module in the AtlasOS eco
 This backlog lists the outstanding work prioritized by business impact.
 
 ### 2.1 Critical Priority (P0)
-*   **Asynchronous Model Load Optimization**: Avoid loading the HuggingFace `SentenceTransformer` model synchronously inside the API thread pool on startup. This causes the uvicorn start to exceed 60 seconds. Refactor to load the model asynchronously in a background thread or spin up a dedicated embedding microservice.
-*   **Alembic Migration Verification**: Ensure all schema updates (like the `processing_jobs.details` JSONB column) are packaged into standard Alembic migration scripts rather than relying on on-startup metadata creation checks.
+*   **Alembic Migration Verification**: Ensure all schema updates (like the `processing_jobs.details` JSONB column and new tables) are fully validated in migration scripts.
 
 ### 2.2 High Priority (P1)
 *   **Virtual list rendering in Copilot Chat**: Prevents DOM slowdowns when chats exceed 100+ messages.
-*   **CSV/XLSX Ingestion support**: Build dedicated spreadsheet parsers inside `document_processor.py` to allow bulk loading of asset tags.
 
 ### 2.3 Medium Priority (P2)
 *   **SSO Integration**: Add support for OpenID Connect (OIDC) / SAML 2.0 logins.

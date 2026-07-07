@@ -566,3 +566,241 @@ def batch_extract_entities(texts: List[str], tenant_id: str = None) -> List[Dict
             results.append({"entities": entities, "relationships": relationships})
 
     return [r if r is not None else {"entities": [], "relationships": []} for r in results]
+
+
+
+import asyncio
+from dataclasses import dataclass, field
+
+# ----- Tunables -----
+CHUNKS_PER_LLM_CALL = 5
+MAX_CONCURRENT_LLM = 2
+LLM_TIMEOUT_S = 60
+
+@dataclass
+class ExtractionResult:
+    entities: list[dict] = field(default_factory=list)
+    relationships: list[dict] = field(default_factory=list)
+
+def _batch_prompt(batch: list[dict]) -> str:
+    parts = []
+    for c in batch:
+        parts.append(f"[CHUNK {c['chunk_id']}]\n{c['text']}\n")
+    body = "\n".join(parts)
+    
+    return f"""Analyze each numbered industrial text chunk and extract entities and relationships.
+
+Use hyphen notation for equipment tags (C-17 not C17).
+Entity type must be one of: {sorted(VALID_LABELS)}
+Relationship type must be one of: {sorted(VALID_RELATIONSHIPS)}
+
+Return STRICT JSON, one object per chunk:
+{{
+  "results": [
+    {{
+      "chunk_id": <int>,
+      "entities": [{{"name": "...", "type": "...", "properties": {{}}, "confidence": 0.0}}],
+      "relationships": [{{"source": "...", "target": "...", "type": "...", "confidence": 0.0}}]
+    }}
+  ]
+}}
+
+CHUNKS:
+{body}
+"""
+
+def _parse_batch_response(data: dict, batch: list[dict]) -> dict[int, ExtractionResult]:
+    out: dict[int, ExtractionResult] = {c["chunk_id"]: ExtractionResult() for c in batch}
+    if not isinstance(data, dict):
+        return out
+
+    for item in data.get("results", []):
+        cid = item.get("chunk_id")
+        if cid not in out:
+            continue
+        ents = []
+        for e in item.get("entities", []):
+            etype = e.get("type")
+            if etype not in VALID_LABELS:
+                continue
+            e["name"] = canonicalize_entity_name(e.get("name", ""))
+            e.setdefault("extraction_method", "llm")
+            ents.append(e)
+        rels = [
+            r for r in item.get("relationships", [])
+            if r.get("type") in VALID_RELATIONSHIPS
+        ]
+        for r in rels:
+            r["source"] = canonicalize_entity_name(r.get("source", ""))
+            r["target"] = canonicalize_entity_name(r.get("target", ""))
+        out[cid] = ExtractionResult(entities=ents, relationships=rels)
+    return out
+
+async def _call_llm(prompt: str) -> dict:
+    from backend.utils.llm_client import structured_complete
+    return await asyncio.to_thread(
+        structured_complete,
+        prompt,
+        "You are a senior process safety analyst. Return strict JSON only.",
+        3000
+    )
+
+async def extract_entities_batched(chunks: list[str]) -> list[ExtractionResult]:
+    indexed = [{"chunk_id": i, "text": t} for i, t in enumerate(chunks)]
+    batches = [
+        indexed[i:i + CHUNKS_PER_LLM_CALL]
+        for i in range(0, len(indexed), CHUNKS_PER_LLM_CALL)
+    ]
+
+    sem = asyncio.Semaphore(MAX_CONCURRENT_LLM)
+
+    async def run_batch(batch: list[dict]) -> dict[int, ExtractionResult]:
+        async with sem:
+            try:
+                raw_dict = await _call_llm(_batch_prompt(batch))
+                return _parse_batch_response(raw_dict, batch)
+            except Exception as e:
+                logger.error("Batch extraction failed (%d chunks): %s", len(batch), e)
+                return {c["chunk_id"]: ExtractionResult() for c in batch}
+
+    batch_results = await asyncio.gather(*[run_batch(b) for b in batches])
+
+    merged: dict[int, ExtractionResult] = {}
+    for d in batch_results:
+        merged.update(d)
+
+    results: list[ExtractionResult] = []
+    for i, text in enumerate(chunks):
+        res = merged.get(i, ExtractionResult())
+        names = {e["name"] for e in res.entities}
+        for e in regex_extract_industrial_entities(text):
+            if e["name"] not in names:
+                res.entities.append(e)
+        results.append(res)
+    return results
+
+
+import hashlib
+from backend.db.postgres import SessionLocal, CachedExtraction
+from backend.config import get_settings
+
+def _get_doc_hash(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+def extract_entities_one_call(full_document_text: str, tenant_id: str, doc_id: int) -> dict:
+    """
+    One LLM call per document + Regex + Cache.
+    Returns: {"entities": [...], "relationships": [...]}
+    """
+    settings = get_settings()
+    doc_hash = _get_doc_hash(full_document_text)
+    
+    db = SessionLocal()
+    try:
+        # 1. Check Cache
+        cached = db.query(CachedExtraction).filter(CachedExtraction.file_hash == doc_hash).first()
+        if cached:
+            try:
+                logger.info(f"Using cached extraction for doc_id {doc_id}")
+                return json.loads(cached.llm_json)
+            except Exception as e:
+                logger.warning(f"Failed to load cached extraction: {e}")
+        
+        # 2. Regex Extraction
+        regex_entities = regex_extract_industrial_entities(full_document_text)
+        regex_rels = []
+        
+        # 3. LLM Extraction (Optional if disabled)
+        llm_entities, llm_rels = [], []
+        if not settings.DISABLE_LLM_EXTRACTION:
+            # We skip sending the huge regex list to LLM to save tokens, we just let LLM extract what it can
+            # But we could optionally scrub regex terms.
+            prompt = f"""Analyze the following text and extract entities and relationships.
+Use hyphen notation for equipment tags (e.g. C-17 not C17).
+Entity type must be one of: {sorted(VALID_LABELS)}
+Relationship type must be one of: {sorted(VALID_RELATIONSHIPS)}
+
+Return STRICT JSON:
+{{
+  "entities": [{{"name": "...", "type": "...", "confidence": 0.0}}],
+  "relationships": [{{"source": "...", "target": "...", "type": "...", "confidence": 0.0}}]
+}}
+
+TEXT:
+{full_document_text}
+"""
+            sys_prompt = "You are an expert Industrial Knowledge Graph extractor. Only output valid JSON matching the schema."
+            from backend.utils.llm_provider import get_provider
+            
+            try:
+                provider = get_provider()
+                res = provider.structured_complete(prompt, system_prompt=sys_prompt, max_tokens=2500)
+                if isinstance(res, dict) and "entities" in res:
+                    llm_entities = res.get("entities", [])
+                    llm_rels = res.get("relationships", [])
+            except Exception as e:
+                logger.error(f"LLM extraction failed: {e}")
+                
+        # 4. Merge results
+        # Normalize and filter
+        all_entities = regex_entities + llm_entities
+        all_rels = regex_rels + llm_rels
+        
+        final_entities = []
+        seen_entities = set()
+        for e in all_entities:
+            c_name = canonicalize_entity_name(e.get("name", ""))
+            if not c_name: continue
+            if c_name not in seen_entities:
+                seen_entities.add(c_name)
+                # Keep valid labels only
+                lbl = e.get("type", "Entity")
+                if lbl not in VALID_LABELS:
+                    lbl = "Entity"
+                final_entities.append({
+                    "name": c_name,
+                    "canonical_id": c_name,
+                    "type": lbl,
+                    "confidence": e.get("confidence", 1.0),
+                    "tenant_id": tenant_id,
+                    "document_id": doc_id
+                })
+                
+        final_rels = []
+        for r in all_rels:
+            src = canonicalize_entity_name(r.get("source", ""))
+            tgt = canonicalize_entity_name(r.get("target", ""))
+            if not src or not tgt: continue
+            
+            rel_type = r.get("type", "RELATED_TO").upper().replace(" ", "_")
+            if rel_type not in VALID_RELATIONSHIPS:
+                rel_type = RELATIONSHIP_TYPE_MAP.get(rel_type, "RELATED_TO")
+                
+            final_rels.append({
+                "source": src,
+                "target": tgt,
+                "type": rel_type,
+                "confidence": r.get("confidence", 1.0),
+                "tenant_id": tenant_id,
+                "document_id": doc_id
+            })
+            
+        final_result = {"entities": final_entities, "relationships": final_rels}
+        
+        # 5. Save to Cache
+        if not settings.DISABLE_LLM_EXTRACTION: # Only cache if LLM actually ran
+            try:
+                cache_entry = CachedExtraction(
+                    file_hash=doc_hash,
+                    provider=settings.LLM_PROVIDER,
+                    llm_json=json.dumps(final_result)
+                )
+                db.add(cache_entry)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                logger.warning(f"Failed to cache extraction: {e}")
+                
+        return final_result
+    finally:
+        db.close()

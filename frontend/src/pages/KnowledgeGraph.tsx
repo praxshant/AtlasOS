@@ -1,111 +1,11 @@
+import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getJson } from '../api/client';
-import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/Card';
-import { Badge } from '../components/ui/Badge';
-import { Network, Upload } from 'lucide-react';
-import { Link } from 'react-router-dom';
-import { Skeleton } from '../components/ui/Skeleton';
-
-export function KnowledgeGraph() {
-  const { data, isLoading } = useQuery({
-    queryKey: ['graph-data'],
-    queryFn: () => getJson<any>('/graph/data'),
-  });
-
-  const nodes = data?.nodes || [];
-  const edges = data?.edges || [];
-  const isEmpty = nodes.length === 0;
-
-  if (isLoading) {
-    return (
-      <div className="space-y-5">
-        <h2 className="text-xl font-semibold tracking-tight">Knowledge Graph</h2>
-        <Skeleton className="h-[calc(100vh-10rem)] w-full" />
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-5 flex flex-col h-[calc(100vh-6rem)]">
-      <div className="flex items-center justify-between mb-6">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight text-white">Knowledge Graph</h2>
-          <p className="text-zinc-400">Interactive visualization of industrial knowledge</p>
-        </div>
-        {!isEmpty && (
-          <div className="flex gap-2">
-            <Badge variant="outline">{nodes.length} nodes</Badge>
-            <Badge variant="outline">{edges.length} edges</Badge>
-          </div>
-        )}
-      </div>
-
-      {isEmpty ? (
-        <Card className="flex-1 flex flex-col items-center justify-center text-center py-16">
-          <div className="w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center mb-4">
-            <Network size={24} className="text-primary" />
-          </div>
-          <h3 className="text-lg font-semibold mb-2">No graph data yet</h3>
-          <p className="text-sm text-on-surface-variant max-w-md mb-6">
-            Upload and process industrial documents to automatically build a knowledge graph of assets, procedures, personnel, and incidents.
-          </p>
-          <Link
-            to="/documents"
-            className="px-4 py-2 bg-primary text-on-primary rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors flex items-center gap-2"
-          >
-            <Upload size={14} /> Upload Documents
-          </Link>
-        </Card>
-      ) : (
-        <Card className="flex-1 flex flex-col overflow-hidden">
-          <CardContent className="flex-1 p-0 overflow-auto">
-            {/* Node list grouped by label */}
-            <div className="p-4 space-y-4">
-              {Object.entries(groupByLabel(nodes)).map(([label, group]) => (
-                <div key={label}>
-                  <div className="flex items-center gap-2 mb-2">
-                    <div className={`w-2 h-2 rounded-full ${labelColor(label)}`} />
-                    <span className="text-xs font-mono uppercase tracking-wider text-on-surface-variant">
-                      {label} ({(group as any[]).length})
-                    </span>
-                  </div>
-                  <div className="flex flex-wrap gap-1.5">
-                    {(group as any[]).map((node: any) => (
-                      <Badge key={node.id} variant="outline" className="text-xs cursor-pointer hover:bg-surface-variant/30">
-                        {node.name}
-                      </Badge>
-                    ))}
-                  </div>
-                </div>
-              ))}
-
-              {edges.length > 0 && (
-                <div className="pt-4 border-t border-outline-variant/30">
-                  <span className="text-xs font-mono uppercase tracking-wider text-on-surface-variant">
-                    Relationships ({edges.length})
-                  </span>
-                  <div className="mt-2 space-y-1 max-h-[300px] overflow-y-auto">
-                    {edges.slice(0, 50).map((e: any, i: number) => (
-                      <div key={i} className="text-xs text-on-surface-variant flex items-center gap-1.5 py-0.5">
-                        <span className="text-on-surface font-medium">{e.source}</span>
-                        <span className="text-primary font-mono">→ {e.type} →</span>
-                        <span className="text-on-surface font-medium">{e.target}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-      )}
-    </div>
-  );
-}
+import { Share2, Filter } from 'lucide-react';
 
 function groupByLabel(nodes: any[]) {
   return nodes.reduce((acc: Record<string, any[]>, node) => {
-    const label = node.label || 'Entity';
+    const label = node.label || node.type || 'Entity';
     if (!acc[label]) acc[label] = [];
     acc[label].push(node);
     return acc;
@@ -114,12 +14,173 @@ function groupByLabel(nodes: any[]) {
 
 function labelColor(label: string): string {
   const map: Record<string, string> = {
-    Asset: 'bg-primary',
-    Equipment: 'bg-primary',
-    Person: 'bg-success',
-    Incident: 'bg-error',
-    Procedure: 'bg-warning',
-    Regulation: 'bg-secondary',
+    Asset: 'var(--accent)',
+    Equipment: 'var(--accent)',
+    Person: 'var(--status-ok)',
+    Incident: 'var(--status-danger)',
+    Procedure: 'var(--status-warn)',
+    Regulation: 'var(--text-secondary)',
   };
-  return map[label] || 'bg-outline';
+  return map[label] || 'var(--text-tertiary)';
+}
+
+export function KnowledgeGraph() {
+  const [searchTerm, setSearchTerm] = useState('');
+  const [selectedDocId, setSelectedDocId] = useState<string>('');
+
+  const { data: docsData } = useQuery({
+    queryKey: ['documents'],
+    queryFn: () => getJson<any>('/documents'),
+  });
+  const documents = Array.isArray(docsData) ? docsData : docsData?.documents || [];
+
+  const { data, isLoading } = useQuery({
+    queryKey: ['graph-data', selectedDocId],
+    queryFn: () => getJson<any>(`/graph/data${selectedDocId ? `?document_ids=${selectedDocId}` : ''}`),
+  });
+
+  const rawNodes = data?.nodes || [];
+  const rawEdges = data?.edges || [];
+
+  const normalize = (s: string) => (s || '').toLowerCase().replace(/[- ]/g, '');
+
+  const filteredNodes = searchTerm.trim()
+    ? rawNodes.filter((n: any) =>
+        normalize(n.name).includes(normalize(searchTerm)) ||
+        normalize(n.id).includes(normalize(searchTerm))
+      )
+    : rawNodes;
+
+  const filteredNodeIds = new Set(filteredNodes.map((n: any) => n.id));
+  const filteredEdges = searchTerm.trim()
+    ? rawEdges.filter((e: any) => filteredNodeIds.has(e.source) || filteredNodeIds.has(e.target))
+    : rawEdges;
+
+  const nodeTypeCount = new Set(rawNodes.map((n: any) => n.label || n.type)).size;
+  const grouped = groupByLabel(filteredNodes);
+
+  return (
+    <div>
+      {/* Page Header */}
+      <div className="page-header" style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-4)', justifyContent: 'space-between', alignItems: 'center' }}>
+        <div>
+          <h1>Knowledge Graph</h1>
+          <p className="page-subtitle">Entity relationship map</p>
+        </div>
+        <div style={{ display: 'flex', gap: 'var(--space-4)', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', background: 'var(--bg-subtle)', padding: '4px 12px', borderRadius: '6px', border: '1px solid var(--border-default)' }}>
+            <Filter size={14} className="text-on-surface-variant" />
+            <select
+              value={selectedDocId}
+              onChange={e => setSelectedDocId(e.target.value)}
+              style={{ background: 'transparent', border: 'none', fontSize: 'var(--text-sm)', color: 'var(--text-primary)', outline: 'none' }}
+            >
+              <option value="">All Documents</option>
+              {documents.map((doc: any) => (
+                <option key={doc.id} value={doc.id}>{doc.filename}</option>
+              ))}
+            </select>
+          </div>
+          <div className="graph-search-bar" style={{ margin: 0 }}>
+            <input
+              className="input-field"
+              type="text"
+              placeholder="Search nodes..."
+              value={searchTerm}
+              onChange={e => setSearchTerm(e.target.value)}
+            />
+            {searchTerm && (
+              <button className="btn-secondary" onClick={() => setSearchTerm('')}>Clear</button>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Stats Row */}
+      <div className="stat-row" style={{ marginBottom: 'var(--space-6)' }}>
+        <div className="card"><div className="stat-block"><span className="stat-value">{rawNodes.length}</span><span className="stat-label">Total Nodes</span></div></div>
+        <div className="card"><div className="stat-block"><span className="stat-value">{rawEdges.length}</span><span className="stat-label">Relationships</span></div></div>
+        <div className="card"><div className="stat-block"><span className="stat-value">{nodeTypeCount}</span><span className="stat-label">Entity Types</span></div></div>
+        {searchTerm && (
+          <div className="card"><div className="stat-block"><span className="stat-value">{filteredNodes.length}</span><span className="stat-label">Filtered</span></div></div>
+        )}
+      </div>
+
+      {isLoading ? (
+        <div className="skeleton" style={{ height: 400 }} />
+      ) : rawNodes.length === 0 && !selectedDocId ? (
+        <div className="card">
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', padding: 'var(--space-16)', textAlign: 'center', color: 'var(--text-tertiary)' }}>
+            <Share2 size={32} style={{ marginBottom: 'var(--space-4)', opacity: 0.4 }} />
+            <p style={{ fontSize: 'var(--text-sm)' }}>No graph data yet. Upload and process documents to build the knowledge graph.</p>
+          </div>
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 'var(--space-6)' }}>
+          {/* Node Groups */}
+          <div className="card">
+            <div className="card-header">
+              <h3>Entities by Type</h3>
+              <span className="page-header-meta">{filteredNodes.length} nodes</span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-4)' }}>
+              {Object.entries(grouped).map(([label, group]) => (
+                <div key={label}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', marginBottom: 'var(--space-2)' }}>
+                    <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: labelColor(label), flexShrink: 0 }} />
+                    <span style={{ fontSize: 'var(--text-xs)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--text-tertiary)' }}>
+                      {label} ({(group as any[]).length})
+                    </span>
+                  </div>
+                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 'var(--space-1)' }}>
+                    {(group as any[]).map((node: any) => (
+                      <span
+                        key={node.id}
+                        className="badge badge-neutral"
+                        style={{ fontFamily: 'var(--font-mono)', cursor: 'default' }}
+                      >
+                        {node.name}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Relationship List */}
+          <div className="card">
+            <div className="card-header">
+              <h3>Relationships</h3>
+              <span className="page-header-meta">{filteredEdges.length}</span>
+            </div>
+            <div style={{ maxHeight: 500, overflowY: 'auto' }}>
+              {filteredEdges.length === 0 ? (
+                <p style={{ color: 'var(--text-tertiary)', fontSize: 'var(--text-sm)', textAlign: 'center', padding: 'var(--space-6)' }}>No edges match.</p>
+              ) : (
+                filteredEdges.slice(0, 60).map((e: any, i: number) => (
+                  <div
+                    key={i}
+                    style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 'var(--space-2)',
+                      padding: 'var(--space-2) 0',
+                      borderBottom: '1px solid var(--border-default)',
+                      fontSize: 'var(--text-xs)',
+                      flexWrap: 'wrap',
+                    }}
+                  >
+                    <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{e.source}</span>
+                    <span style={{ color: 'var(--accent)', fontFamily: 'var(--font-mono)' }}>→{e.type}→</span>
+                    <span style={{ color: 'var(--text-primary)', fontWeight: 500 }}>{e.target}</span>
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }

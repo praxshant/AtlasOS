@@ -23,5 +23,11 @@ def test_compliance_check(client, auth_headers):
     
     data = resp.json()
     assert "compliance_score" in data
-    assert "gaps" in data
-    assert isinstance(data["gaps"], list)
+    assert "evaluations" in data
+    assert isinstance(data["evaluations"], list)
+    
+    if data["evaluations"]:
+        first_eval = data["evaluations"][0]
+        assert "clause_id" in first_eval
+        assert "status" in first_eval
+        assert "confidence" in first_eval

@@ -177,7 +177,9 @@ def evaluate_compliance_node(state: ComplianceState) -> Dict[str, Any]:
     1. Check if the document clauses satisfy the requirement (using clause-level keyword/semantic match).
     2. Identify any missing process, safety measures, or compliance records (gaps).
     3. Assign a risk level (Low, Medium, High).
-    4. Provide specific recommendations to close the gaps.
+    4. For each requirement, extract the specific evidence excerpt from the clauses.
+    5. Provide a confidence score (0-100) based on how explicitly the document meets the requirement.
+    6. Provide specific recommendations to close the gaps.
     
     Generate a JSON report matching this structure:
     {{
@@ -185,13 +187,16 @@ def evaluate_compliance_node(state: ComplianceState) -> Dict[str, Any]:
       "compliant_count": 4,
       "gap_count": 1,
       "overall_risk": "Medium",
-      "gaps": [
+      "evaluations": [
         {{
-          "regulation": "Name of regulation",
+          "clause_id": "ID of the regulation",
           "requirement": "Description of regulation requirement",
-          "finding": "Specific gap or non-compliance found in the document.",
-          "risk_level": "High",
-          "recommendation": "Clear instruction to fix the gap."
+          "status": "COMPLIANT", 
+          "confidence": 90,
+          "evidence_excerpt": "Specific text from the document that proves compliance...",
+          "missing_evidence": "What is missing if status is NON_COMPLIANT",
+          "risk_level": "Low",
+          "recommendation": "Clear instruction to fix the gap if any."
         }}
       ]
     }}
@@ -208,7 +213,7 @@ def evaluate_compliance_node(state: ComplianceState) -> Dict[str, Any]:
             "compliance_score": 0,
             "compliant_count": 0,
             "gap_count": 1,
-            "gaps": [{"regulation": "Compliance Checker", "requirement": "Automated evaluation", "finding": f"Failed checking compliance: {e}", "risk_level": "Medium", "recommendation": "Conduct manual compliance review."}],
+            "evaluations": [{"clause_id": "ERR-1", "requirement": "Automated evaluation", "status": "NON_COMPLIANT", "confidence": 0, "evidence_excerpt": "", "missing_evidence": f"Failed checking compliance: {e}", "risk_level": "Medium", "recommendation": "Conduct manual compliance review."}],
             "overall_risk": "Medium"
         }
         return {"report": fallback}

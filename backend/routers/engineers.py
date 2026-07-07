@@ -25,7 +25,8 @@ def get_engineers(tenant_id: str = Depends(get_current_tenant_id)):
         WITH a, count(distinct i) as incident_count
         WHERE incident_count > 0
         
-        OPTIONAL MATCH (a)<-[:MAINTAINED_BY|INSPECTED_BY|OPERATED_BY|KNOWLEDGE_OWNER|OWNED_BY|KNOWLEDGE_OWNER_FOR]-(p:Person)
+        OPTIONAL MATCH (a)<-[:MAINTAINED_BY|INSPECTED_BY|OPERATED_BY|KNOWLEDGE_OWNER|OWNED_BY|KNOWLEDGE_OWNER_FOR]-(p)
+        WHERE p.type = 'Person' OR p.entity_type = 'Person' OR 'Person' IN labels(p)
         RETURN a.name as asset, collect(p.name) as experts
         """
         critical_assets = neo4j_client.run_query(query, {"tenant_id": tenant_id})
@@ -59,7 +60,8 @@ def get_engineer_expertise(name: str, tenant_id: str = Depends(get_current_tenan
     Returns detailed expertise profile for a specific engineer.
     """
     query = """
-    MATCH (p:Person {name: $name, tenant_id: $tenant_id})
+    MATCH (p {name: $name, tenant_id: $tenant_id})
+    WHERE p.type = 'Person' OR p.entity_type = 'Person' OR 'Person' IN labels(p)
     
     OPTIONAL MATCH (p)-[:AUTHORED_BY|DOCUMENTED_BY_PERSON|WRITTEN_BY|SUBMITTED_BY|REPORTED_BY]-(d)
     WITH p, count(distinct d) as doc_count
@@ -119,7 +121,8 @@ def get_equipment_expert_risk(equipment: str, tenant_id: str = Depends(get_curre
     """
     query = """
     MATCH (e) WHERE (e:Equipment OR e:Asset) AND e.name = $equipment AND e.tenant_id = $tenant_id
-    OPTIONAL MATCH (e)-[:MAINTAINED_BY|INSPECTED_BY|OPERATED_BY|KNOWLEDGE_OWNER|OWNED_BY]-(p:Person)
+    OPTIONAL MATCH (e)-[:MAINTAINED_BY|INSPECTED_BY|OPERATED_BY|KNOWLEDGE_OWNER|OWNED_BY]-(p)
+    WHERE p.type = 'Person' OR p.entity_type = 'Person' OR 'Person' IN labels(p)
     RETURN p.name as name, p.retirement_risk as retirement_risk
     """
     results = neo4j_client.run_query(query, {"equipment": equipment, "tenant_id": tenant_id})

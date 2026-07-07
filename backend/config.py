@@ -68,6 +68,18 @@ class Settings(BaseSettings):
     # Celery
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
+    CELERY_POOL: str = "threads"        # threads | prefork | gevent | solo
+    CELERY_CONCURRENCY: int = 4
+
+    # LLM Provider Abstraction
+    OLLAMA_ENABLED: bool = False
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "mistral"
+    DISABLE_LLM_EXTRACTION: bool = False  # skip LLM when quota exhausted
+
+    # Batch sizes
+    EMBED_BATCH_SIZE: int = 64
+    NEO4J_BATCH_SIZE: int = 500
 
     model_config = SettingsConfigDict(
         env_file=(".env", "../.env", "../../.env"), 

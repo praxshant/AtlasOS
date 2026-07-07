@@ -71,7 +71,7 @@ AtlasOS utilizes a hybrid storage architecture designed for absolute decoupling,
 ### 2.1 The Storage Triad
 To model a plant digital twin faithfully, the system decouples its storage into three specialized layers:
 *   **Relational Metastore (PostgreSQL)**: Manages transactional user authentication, multi-tenant boundaries, background job progress logs, and document upload records.
-*   **Property Graph (Neo4j)**: Maps physical plant structures, engineers, and causal incident relations as connected nodes and edges, allowing multi-hop cypher traversals.
+*   **Property Graph (Neo4j)**: Models plant structures, engineers, regulations, and causal incident relations under a unified, query-efficient `:Entity` schema (using unique `canonical_id` indexing per tenant) with generic `:REL` relationships. This enables APOC-free Cypher traversals, simplifies ontology representation, and improves bulk insertion performance.
 *   **Dense Vector Store (Qdrant)**: Houses high-dimensional embeddings of parsed document chunks, providing semantic search index lookup.
 
 ### 2.2 Decoupled Agent Reasoning

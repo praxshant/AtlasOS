@@ -26,6 +26,12 @@ This section details the manual verification commands, expected responses, failu
 | **Vite Frontend** | `curl -sI http://localhost:5173` | `HTTP/1.1 200 OK` | Verify local Node modules (`npm install`). Check for typescript compilation errors. |
 | **Celery Worker** | `celery -A backend.tasks.celery_app status` | `celery@localhost: OK` | Ensure virtual environment is active. Verify broker connection in `.env`. |
 
+### 1.3 Unified Database Verification Script
+Before starting the API backend or Celery tasks, run the unified verification script to assert connection health, check database credentials, and list initialized indices:
+```bash
+python scripts/verify_databases.py
+```
+
 ---
 
 ## 2. API Integration & Runtime Routing Matrix
@@ -74,6 +80,16 @@ If Postgres metadata exists but associated Qdrant vectors or Neo4j nodes are mis
    ```
 3. Re-upload raw files from the document interface.
 
+### 3.3 Bootstrapping & Seeding Demo Data
+To bootstrap the database schema and ingest a pre-packaged suite of industrial documentation (manuals, incident reports, shift handovers) for local demonstration and verification:
+```bash
+python scripts/bootstrap_demo.py
+```
+This script automates:
+1. Re-migrating PostgreSQL and seeding the default organization tenant.
+2. Generating and validating Neo4j index constraints.
+3. Iterating and processing the default document registry, creating embeddings in Qdrant, and inserting consolidated nodes/edges in Neo4j.
+
 ---
 
 ## 4. Observability & SRE Operations
@@ -91,3 +107,27 @@ If Postgres metadata exists but associated Qdrant vectors or Neo4j nodes are mis
     *   `INFO`: Normal operation transactions (e.g. `User registration success`, `Embedding initialized`).
     *   `WARNING`: Recoverable failures (e.g. `Rate limit triggered`, `Redis connection timeout - falling open`).
     *   `ERROR`: Non-recoverable failures (e.g. `Celery execution failure`, `Database transaction rollback`).
+
+---
+
+## 5. Pipeline Evaluation & Testing Suite
+
+AtlasOS features a dedicated testing and evaluation framework to profile system accuracy, retrieval quality, and response latency.
+
+### 5.1 Running the Evaluator
+To run the full evaluation suite covering retrieval, graph construction, extraction recall, and answer synthesis:
+```bash
+python -m backend.eval
+```
+Individual evaluator modules can also be executed:
+*   **Answer Synthesis**: `python backend/eval/answer_eval.py`
+*   **Compliance Agent**: `python backend/eval/compliance_eval.py`
+*   **Entity Extraction**: `python backend/eval/extraction_eval.py`
+*   **Graph Construction**: `python backend/eval/graph_eval.py`
+*   **Retrieval (Hybrid)**: `python backend/eval/retrieval_eval.py`
+*   **Pipeline Latency Profiling**: `python backend/eval/latency_eval.py`
+
+### 5.2 Evaluation Outputs
+All evaluation runs generate detailed JSON report files in:
+`backend/eval/results/eval_report_<timestamp>.json`
+These files record execution metrics, retrieval recall/precision, entity mismatch rates, and total execution latencies. (Note: These results are ignored by Git configuration).

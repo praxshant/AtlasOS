@@ -21,13 +21,15 @@ class QdrantClientWrapper:
         self.url = settings.QDRANT_URL
         self._client = None
         self._embed_model = None
+        self._embed_model = None
         self._vector_size = None
         self._lock = threading.Lock()
+        self._embed_cache = {} # Hash cache for embeddings
         self._connect()
 
     def _connect(self):
         try:
-            self._client = QdrantClient(url=self.url)
+            self._client = QdrantClient(url=self.url, timeout=5.0)
             logger.info("Successfully connected to Qdrant.")
         except Exception as e:
             logger.error(f"Failed to connect to Qdrant at {self.url}: {e}")
@@ -119,6 +121,44 @@ class QdrantClientWrapper:
             except Exception as e:
                 logger.warning(f"Payload index on {field_name} may already exist: {e}")
 
+
+    def embed_texts(self, texts: List[str]) -> List[List[float]]:
+        self._load_embed_model()
+        if not self._embed_model:
+            logger.warning("Embedding model not loaded, returning empty vectors.")
+            return [[0.0] * 384 for _ in texts]
+        
+        import hashlib
+        results = []
+        texts_to_embed = []
+        indices_to_embed = []
+        
+        for i, text in enumerate(texts):
+            thash = hashlib.sha256(text.encode('utf-8')).hexdigest()
+            if thash in self._embed_cache:
+                results.append(self._embed_cache[thash])
+            else:
+                results.append(None) # Placeholder
+                texts_to_embed.append(text)
+                indices_to_embed.append((i, thash))
+                
+        if texts_to_embed:
+            start = time.time()
+            batch_size = getattr(settings, 'EMBED_BATCH_SIZE', 64)
+            embeddings = self._embed_model.encode(texts_to_embed, batch_size=batch_size, normalize_embeddings=True).tolist()
+            dur = time.time() - start
+            logger.info(f"Embedded {len(texts_to_embed)} new chunks in {dur:.2f}s")
+            
+            for (orig_idx, thash), emb in zip(indices_to_embed, embeddings):
+                results[orig_idx] = emb
+                self._embed_cache[thash] = emb
+                
+            # Naive cache eviction to prevent unbounded growth
+            if len(self._embed_cache) > 10000:
+                self._embed_cache.clear()
+                
+        return results
+
     def embed_text(self, text: str) -> List[float]:
         self._load_embed_model()
         if not self._embed_model:
@@ -142,7 +182,10 @@ class QdrantClientWrapper:
         points = []
         qdrant_ids = []
 
-        for chunk in chunks:
+        texts = [chunk.get("text", "") for chunk in chunks]
+        vectors = self.embed_texts(texts)
+
+        for chunk, vector in zip(chunks, vectors):
             text = chunk.get("text", "")
             doc_id = chunk.get("doc_id")
             page = chunk.get("page", 1)
@@ -153,8 +196,6 @@ class QdrantClientWrapper:
             q_id = chunk.get("qdrant_id")
             if not q_id:
                 q_id = str(uuid.uuid4())
-
-            vector = self.embed_text(text)
             
             payload = {
                 "text": text,

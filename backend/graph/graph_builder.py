@@ -27,6 +27,13 @@ def upsert_entity(entity: Dict[str, Any], doc_id: int, tenant_id: str = "default
     aliases = entity.get("aliases", [name])
     extraction_method = entity.get("source", "llm")
     
+    subtype = entity.get("subtype")
+    subclass = entity.get("subclass")
+    if subtype:
+        properties["subtype"] = subtype
+    if subclass:
+        properties["subclass"] = subclass
+    
     asset_id = None
     if label == "Equipment":
         match = re.search(r'\b([A-Z]{1,3}-\d{2,4}[A-Z]?)\b', name)
@@ -74,6 +81,28 @@ def upsert_entity(entity: Dict[str, Any], doc_id: int, tenant_id: str = "default
 
     try:
         neo4j_client.run_query(cypher, params)
+        
+        # Ontology: create IS_A edges
+        if subtype:
+            hierarchy_cypher = f"""
+            MATCH (n:{label} {{canonical_id: $canonical_id, tenant_id: $tenant_id}})
+            MERGE (sub:Subtype {{name: $subtype, tenant_id: $tenant_id}})
+            ON CREATE SET sub.created_at = timestamp()
+            MERGE (n)-[:IS_A {{tenant_id: $tenant_id}}]->(sub)
+            """
+            neo4j_client.run_query(hierarchy_cypher, {"canonical_id": canonical_id, "tenant_id": tenant_id, "subtype": subtype})
+            
+            if subclass:
+                subclass_cypher = f"""
+                MATCH (sub:Subtype {{name: $subtype, tenant_id: $tenant_id}})
+                MERGE (cls:Subclass {{name: $subclass, tenant_id: $tenant_id}})
+                ON CREATE SET cls.created_at = timestamp()
+                MERGE (sub)-[:IS_A {{tenant_id: $tenant_id}}]->(cls)
+                MERGE (n:{label} {{canonical_id: $canonical_id, tenant_id: $tenant_id}})
+                MERGE (n)-[:IS_A {{tenant_id: $tenant_id}}]->(cls)
+                """
+                neo4j_client.run_query(subclass_cypher, {"canonical_id": canonical_id, "tenant_id": tenant_id, "subtype": subtype, "subclass": subclass})
+                
         return True
     except Exception as e:
         logger.error(f"Failed to upsert Neo4j node {name} ({label}): {e}")
@@ -113,9 +142,20 @@ def upsert_relationship(rel: Dict[str, Any], doc_id: int, tenant_id: str = "defa
                   r.confidence = $confidence,
                   r.extraction_method = $extraction_method,
                   r.tenant_id = $tenant_id,
-                  r.created_at = timestamp()
+                  r.created_at = timestamp(),
+                  r.chunk_id = $chunk_id,
+                  r.evidence = $evidence,
+                  r.event_time = $event_time,
+                  r.valid_from = $valid_from,
+                  r.valid_to = $valid_to
     ON MATCH SET r.confidence = case when $confidence > r.confidence then $confidence else r.confidence end,
-                 r.last_updated = timestamp()
+                 r.last_updated = timestamp(),
+                 r.event_time = coalesce($event_time, r.event_time),
+                 r.valid_from = coalesce($valid_from, r.valid_from),
+                 r.valid_to = coalesce($valid_to, r.valid_to),
+                 r.evidence = case when $evidence IS NOT NULL AND r.evidence IS NULL then $evidence 
+                                   when $evidence IS NOT NULL AND size($evidence) > size(coalesce(r.evidence, "")) then $evidence 
+                                   else r.evidence end
     RETURN type(r)
     """
 
@@ -127,7 +167,12 @@ def upsert_relationship(rel: Dict[str, Any], doc_id: int, tenant_id: str = "defa
         "tenant_id": tenant_id,
         "source_doc_id": doc_id,
         "confidence": confidence,
-        "extraction_method": extraction_method
+        "extraction_method": extraction_method,
+        "chunk_id": rel.get("chunk_index"),
+        "evidence": rel.get("evidence"),
+        "event_time": rel.get("event_time"),
+        "valid_from": rel.get("valid_from"),
+        "valid_to": rel.get("valid_to")
     }
 
     try:
@@ -256,7 +301,12 @@ def batch_upsert_relationships(relationships: List[Dict[str, Any]], doc_id: int,
             "source_cid": _make_canonical_id(source),
             "target_cid": _make_canonical_id(target),
             "confidence": confidence,
-            "extraction_method": rel.get("extraction_method", "llm")
+            "extraction_method": rel.get("extraction_method", "llm"),
+            "chunk_id": rel.get("chunk_index"),
+            "evidence": rel.get("evidence"),
+            "event_time": rel.get("event_time"),
+            "valid_from": rel.get("valid_from"),
+            "valid_to": rel.get("valid_to")
         })
 
     total_created = 0
@@ -283,9 +333,20 @@ def batch_upsert_relationships(relationships: List[Dict[str, Any]], doc_id: int,
                       r.confidence = rel.confidence,
                       r.extraction_method = rel.extraction_method,
                       r.tenant_id = $tenant_id,
-                      r.created_at = timestamp()
+                      r.created_at = timestamp(),
+                      r.chunk_id = rel.chunk_id,
+                      r.evidence = rel.evidence,
+                      r.event_time = rel.event_time,
+                      r.valid_from = rel.valid_from,
+                      r.valid_to = rel.valid_to
         ON MATCH SET r.confidence = CASE WHEN rel.confidence > r.confidence THEN rel.confidence ELSE r.confidence END,
-                     r.last_updated = timestamp()
+                     r.last_updated = timestamp(),
+                     r.event_time = coalesce(rel.event_time, r.event_time),
+                     r.valid_from = coalesce(rel.valid_from, r.valid_from),
+                     r.valid_to = coalesce(rel.valid_to, r.valid_to),
+                     r.evidence = CASE WHEN rel.evidence IS NOT NULL AND r.evidence IS NULL THEN rel.evidence
+                                       WHEN rel.evidence IS NOT NULL AND size(rel.evidence) > size(coalesce(r.evidence, "")) THEN rel.evidence
+                                       ELSE r.evidence END
         RETURN count(r) as count
         """
         try:
@@ -300,7 +361,9 @@ def batch_upsert_relationships(relationships: List[Dict[str, Any]], doc_id: int,
             logger.warning(f"Batch upsert failed for rel type {rel_type}, falling back: {e}")
             for rel_data in rel_batch:
                 orig = {"source": rel_data["source"], "target": rel_data["target"],
-                        "type": rel_type, "confidence": rel_data["confidence"], "extraction_method": rel_data["extraction_method"]}
+                        "type": rel_type, "confidence": rel_data["confidence"], "extraction_method": rel_data["extraction_method"],
+                        "chunk_index": rel_data["chunk_id"], "evidence": rel_data["evidence"],
+                        "event_time": rel_data.get("event_time"), "valid_from": rel_data.get("valid_from"), "valid_to": rel_data.get("valid_to")}
                 if upsert_relationship(orig, doc_id, tenant_id):
                     total_created += 1
 

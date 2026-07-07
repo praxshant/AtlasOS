@@ -1,145 +1,61 @@
 import json
 import logging
-import time
 from typing import Generator, Optional, Dict, Any
-from openai import OpenAI
-from backend.config import get_settings
-from backend.utils.metrics import record_latency, record_token_usage
+from backend.utils.llm_provider import get_provider
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
-
-# OpenRouter API Client lazy loader
-_client = None
-
-def get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        settings = get_settings()
-        if not settings.OPENROUTER_API_KEY:
-            raise ValueError("OPENROUTER_API_KEY environment variable is not set")
-        _client = OpenAI(
-            api_key=settings.OPENROUTER_API_KEY,
-            base_url="https://openrouter.ai/api/v1"
-        )
-    return _client
 
 def complete(prompt: str, system_prompt: Optional[str] = None) -> str:
     """
     Standard text completion returning a string.
     """
-    openai_client = get_client()
-        
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-
-    start_time = time.time()
     try:
-        from backend.utils.circuit_breaker import openrouter_breaker
-        logger.info("=== SYSTEM MESSAGE ===")
-        logger.info(system_prompt if system_prompt else "[None]")
-        logger.info("=== USER MESSAGE ===")
-        logger.info(prompt)
-        
-        def _do_complete():
-            return openai_client.chat.completions.create(
-                model=settings.OPENROUTER_MODEL,
-                messages=messages,
-                max_tokens=1000
-            )
-            
-        response = openrouter_breaker.call(_do_complete)
-        
-        duration_ms = (time.time() - start_time) * 1000.0
-        record_latency("openrouter", duration_ms)
-        if hasattr(response, "usage") and response.usage:
-            record_token_usage(response.usage.prompt_tokens, response.usage.completion_tokens)
-        return response.choices[0].message.content or ""
+        provider = get_provider()
+        return provider.complete(prompt, system_prompt)
     except Exception as e:
-        logger.error(f"OpenRouter completion failed: {e}")
+        logger.error(f"Completion failed: {e}")
+        from backend.config import get_settings
+        settings = get_settings()
+        if settings.OLLAMA_ENABLED:
+            logger.info("Falling back to Ollama due to completion error.")
+            from backend.utils.llm_provider import OllamaProvider
+            return OllamaProvider().complete(prompt, system_prompt)
         raise e
 
 def structured_complete(prompt: str, system_prompt: Optional[str] = None, max_tokens: int = 2000) -> Dict[str, Any]:
     """
     Structured text completion returning a parsed JSON dictionary.
     """
-    openai_client = get_client()
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-
-    start_time = time.time()
     try:
-        from backend.utils.circuit_breaker import openrouter_breaker
-        logger.info("=== SYSTEM MESSAGE ===")
-        logger.info(system_prompt if system_prompt else "[None]")
-        logger.info("=== USER MESSAGE ===")
-        logger.info(prompt)
-        
-        def _do_structured_complete(msgs):
-            return openai_client.chat.completions.create(
-                model=settings.OPENROUTER_MODEL,
-                messages=msgs,
-                response_format={"type": "json_object"},
-                max_tokens=max_tokens
-            )
-            
-        response = openrouter_breaker.call(_do_structured_complete, messages)
-        
-        duration_ms = (time.time() - start_time) * 1000.0
-        record_latency("openrouter", duration_ms)
-        if hasattr(response, "usage") and response.usage:
-            record_token_usage(response.usage.prompt_tokens, response.usage.completion_tokens)
-        content = response.choices[0].message.content or "{}"
-        
-        def parse_content(response_text: str) -> Optional[Dict]:
-            # LAYER 1: Direct JSON parse
-            try:
-                return json.loads(response_text)
-            except json.JSONDecodeError:
-                pass
-                
-            # LAYER 2: Extract JSON block
-            import re
-            json_block = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', response_text, re.DOTALL)
-            if json_block:
-                try:
-                    return json.loads(json_block.group(1))
-                except json.JSONDecodeError:
-                    pass
-                    
-            # LAYER 3: Find largest JSON-like object
-            start = response_text.find('{')
-            end = response_text.rfind('}')
-            if start != -1 and end != -1 and end > start:
-                try:
-                    return json.loads(response_text[start:end+1])
-                except json.JSONDecodeError:
-                    pass
-            return None
-
-        result = parse_content(content)
-        
-        if result is None or len(content) < 50:
-            logger.warning(f"structured_complete parsing failed or empty. Retrying... Raw: {content[:500]}")
-            retry_msgs = messages.copy()
-            retry_msgs[-1]["content"] += "\n\nIMPORTANT: Respond ONLY with valid JSON. No explanation. No markdown. Just the JSON object."
-            response2 = openrouter_breaker.call(_do_structured_complete, retry_msgs)
-            content2 = response2.choices[0].message.content or "{}"
-            result2 = parse_content(content2)
-            if result2 is not None:
-                return result2
-            logger.warning(f"structured_complete retry failed. Raw: {content2[:500]}")
-            return {"error": "parse_failed", "raw": content2[:1000]}
-            
-        return result
+        provider = get_provider()
+        return provider.structured_complete(prompt, system_prompt, max_tokens)
     except Exception as e:
-        logger.error(f"OpenRouter structured completion failed: {e}")
+        logger.error(f"Structured completion failed: {e}")
+        from backend.config import get_settings
+        settings = get_settings()
+        if settings.OLLAMA_ENABLED:
+            logger.info("Falling back to Ollama due to structured completion error.")
+            from backend.utils.llm_provider import OllamaProvider
+            return OllamaProvider().structured_complete(prompt, system_prompt, max_tokens)
         return {"error": "request_failed", "raw": str(e)}
+
+def stream_complete(prompt: str, system_prompt: Optional[str] = None) -> Generator[str, None, None]:
+    """
+    Streaming text completion returning a token generator.
+    """
+    try:
+        provider = get_provider()
+        yield from provider.stream_complete(prompt, system_prompt)
+    except Exception as e:
+        logger.error(f"Streaming completion failed: {e}")
+        from backend.config import get_settings
+        settings = get_settings()
+        if settings.OLLAMA_ENABLED:
+            logger.info("Falling back to Ollama due to streaming completion error.")
+            from backend.utils.llm_provider import OllamaProvider
+            yield from OllamaProvider().stream_complete(prompt, system_prompt)
+        else:
+            yield f"\\n[Error during generation: {e}]"
 
 def complete_with_context_limit(prompt: str, system_prompt: Optional[str] = None, max_context_tokens: int = 6000) -> str:
     """
@@ -161,51 +77,6 @@ def complete_with_context_limit(prompt: str, system_prompt: Optional[str] = None
     # Truncate earlier context from the front
     truncated_prompt = "..." + prompt[-(allowed_prompt_chars - 3):]
     return truncated_prompt
-
-def stream_complete(prompt: str, system_prompt: Optional[str] = None) -> Generator[str, None, None]:
-    """
-    Streaming text completion returning a token generator.
-    """
-    openai_client = get_client()
-
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": prompt})
-
-    start_time = time.time()
-    try:
-        from backend.utils.circuit_breaker import openrouter_breaker
-        logger.info("=== SYSTEM MESSAGE ===")
-        logger.info(system_prompt if system_prompt else "[None]")
-        logger.info("=== USER MESSAGE ===")
-        logger.info(prompt)
-        
-        def _do_stream_complete():
-            return openai_client.chat.completions.create(
-                model=settings.OPENROUTER_MODEL,
-                messages=messages,
-                stream=True,
-                max_tokens=1500
-            )
-            
-        response = openrouter_breaker.call(_do_stream_complete)
-        
-        token_count = 0
-        for chunk in response:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                token_count += 1
-                yield delta
-        duration_ms = (time.time() - start_time) * 1000.0
-        record_latency("openrouter", duration_ms)
-        # Estimate prompt tokens based on word count multiplier (1.33 tokens/word)
-        prompt_words = len(prompt.split()) + len((system_prompt or "").split())
-        prompt_est = int(prompt_words * 1.33)
-        record_token_usage(prompt_est, token_count)
-    except Exception as e:
-        logger.error(f"OpenRouter streaming completion failed: {e}")
-        yield f"\n[Error during generation: {e}]"
 
 # --- Legacies for Backwards Compatibility ---
 

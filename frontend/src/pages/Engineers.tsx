@@ -1,11 +1,14 @@
 import { useQuery } from '@tanstack/react-query';
 import { getJson } from '../api/client';
-import { Card, CardContent } from '../components/ui/Card';
-import { Table, TableHeader, TableRow, TableHead, TableBody, TableCell } from '../components/ui/Table';
-import { Badge } from '../components/ui/Badge';
-import { Skeleton } from '../components/ui/Skeleton';
-import { Users, Upload } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { Users } from 'lucide-react';
+
+function riskBadge(level: string) {
+  const l = (level || '').toLowerCase();
+  if (l === 'critical') return 'badge-danger';
+  if (l === 'high') return 'badge-warn';
+  if (l === 'medium') return 'badge-info';
+  return 'badge-neutral';
+}
 
 export function Engineers() {
   const { data, isLoading } = useQuery({
@@ -16,103 +19,110 @@ export function Engineers() {
   const engineers = data?.engineers || [];
   const summary = data?.summary || {};
 
-  if (isLoading) {
-    return (
-      <div className="space-y-5">
-        <h2 className="text-xl font-semibold tracking-tight">Engineers</h2>
-        <Skeleton className="h-[400px] w-full" />
-      </div>
-    );
-  }
-
   return (
-    <div className="space-y-5">
-      <h2 className="text-xl font-semibold tracking-tight">Engineers</h2>
+    <div>
+      {/* Page Header */}
+      <div className="page-header">
+        <div>
+          <h1>Engineer Intelligence</h1>
+          <p className="page-subtitle">Personnel expertise mapping and succession risk analysis</p>
+        </div>
+        <Users size={20} style={{ color: 'var(--accent)', opacity: 0.6 }} />
+      </div>
 
-      {engineers.length === 0 ? (
-        <Card className="flex flex-col items-center justify-center py-16 text-center">
-          <div className="w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center mb-4">
-            <Users size={24} className="text-primary" />
+      {isLoading ? (
+        <>
+          <div className="stat-row">
+            {[...Array(4)].map((_, i) => <div key={i} className="skeleton" style={{ height: 72 }} />)}
           </div>
-          <h3 className="text-lg font-semibold mb-2">No engineers found</h3>
-          <p className="text-sm text-on-surface-variant max-w-md mb-6">
-            Engineer data is extracted from uploaded documents. Upload inspection reports or maintenance logs that mention personnel.
-          </p>
-          <Link to="/documents" className="px-4 py-2 bg-primary text-on-primary rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors flex items-center gap-2">
-            <Upload size={14} /> Upload Documents
-          </Link>
-        </Card>
+          <div className="skeleton" style={{ height: 400 }} />
+        </>
+      ) : engineers.length === 0 ? (
+        <div className="card">
+          <div className="empty-state">
+            <Users size={28} style={{ opacity: 0.3 }} />
+            <span>No engineers found. Engineer data is extracted from maintenance logs and inspection reports.</span>
+          </div>
+        </div>
       ) : (
         <>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <KPISmall label="Mapped" value={summary.total_engineers || 0} />
-            <KPISmall label="High Risk" value={summary.high_risk_count || 0} color="danger" />
-            <KPISmall label="Avg Expertise" value={summary.avg_expertise_score || 0} />
-            <KPISmall label="Unprotected Assets" value={summary.critical_assets_unprotected || 0} color="warning" />
+          {/* Stats */}
+          <div className="stat-row">
+            <div className="card"><div className="stat-block"><span className="stat-value">{summary.total_engineers || 0}</span><span className="stat-label">Mapped Engineers</span></div></div>
+            <div className="card"><div className="stat-block"><span className="stat-value" style={{ color: 'var(--status-danger)' }}>{summary.high_risk_count || 0}</span><span className="stat-label">High Risk</span></div></div>
+            <div className="card"><div className="stat-block"><span className="stat-value">{(summary.avg_expertise_score || 0).toFixed(1)}</span><span className="stat-label">Avg Expertise</span></div></div>
+            <div className="card"><div className="stat-block"><span className="stat-value" style={{ color: 'var(--status-warn)' }}>{summary.critical_assets_unprotected || 0}</span><span className="stat-label">Unprotected Assets</span></div></div>
           </div>
 
-          <Card>
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Name</TableHead>
-                    <TableHead>Expertise</TableHead>
-                    <TableHead>Centrality</TableHead>
-                    <TableHead>Succession Risk</TableHead>
-                    <TableHead>Assets</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {engineers.map((eng: any, i: number) => (
-                    <TableRow key={i}>
-                      <TableCell className="font-medium text-sm flex items-center gap-2">
-                        <div className="w-6 h-6 rounded-full bg-surface-variant flex items-center justify-center text-[10px] font-bold text-on-surface-variant uppercase border border-outline-variant/30 shrink-0">
+          {/* Engineer Table */}
+          <div className="card">
+            <div className="card-header">
+              <h3>Personnel Registry</h3>
+              <span className="page-header-meta">{engineers.length} engineers</span>
+            </div>
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Expertise Score</th>
+                  <th>Centrality</th>
+                  <th>Succession Risk</th>
+                  <th>Assets</th>
+                </tr>
+              </thead>
+              <tbody>
+                {engineers.map((eng: any, i: number) => (
+                  <tr key={i}>
+                    <td style={{ color: 'var(--text-primary)', fontWeight: 500 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                        <div style={{
+                          width: 28, height: 28, borderRadius: '50%',
+                          background: 'var(--bg-subtle)',
+                          border: '1px solid var(--border-default)',
+                          display: 'flex', alignItems: 'center', justifyContent: 'center',
+                          fontSize: 'var(--text-xs)', fontWeight: 700,
+                          color: 'var(--text-secondary)', flexShrink: 0,
+                          textTransform: 'uppercase',
+                        }}>
                           {(eng.name || '??').substring(0, 2)}
                         </div>
                         {eng.name}
-                      </TableCell>
-                      <TableCell className="font-mono text-xs">{(eng.expertise_score || 0).toFixed(1)}</TableCell>
-                      <TableCell className="font-mono text-xs">{(eng.centrality || 0).toFixed(3)}</TableCell>
-                      <TableCell>
-                        <Badge
-                          variant={
-                            eng.succession_risk === 'Critical' ? 'danger'
-                              : eng.succession_risk === 'High' ? 'warning'
-                              : 'default'
-                          }
-                        >
-                          {eng.succession_risk || 'Low'}
-                        </Badge>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex flex-wrap gap-1">
-                          {(eng.assets || []).slice(0, 3).map((a: string, ai: number) => (
-                            <Badge key={ai} variant="outline" className="text-[10px]">{a}</Badge>
-                          ))}
-                          {(eng.assets || []).length > 3 && (
-                            <span className="text-[10px] text-on-surface-variant">+{eng.assets.length - 3}</span>
-                          )}
+                      </div>
+                    </td>
+                    <td>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                        <div className="inline-bar" style={{ width: 56 }}>
+                          <div
+                            className={`inline-bar-fill ${(eng.expertise_score || 0) >= 7 ? 'ok' : (eng.expertise_score || 0) >= 4 ? '' : 'danger'}`}
+                            style={{ width: `${((eng.expertise_score || 0) / 10) * 100}%` }}
+                          />
                         </div>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
+                        <span className="text-mono text-tertiary" style={{ fontSize: 'var(--text-xs)' }}>
+                          {(eng.expertise_score || 0).toFixed(1)}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="text-mono text-tertiary">{(eng.centrality || 0).toFixed(3)}</td>
+                    <td><span className={`badge ${riskBadge(eng.succession_risk)}`}>{eng.succession_risk || 'Low'}</span></td>
+                    <td>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                        {(eng.assets || []).slice(0, 3).map((a: string, ai: number) => (
+                          <span key={ai} className="badge badge-neutral" style={{ fontFamily: 'var(--font-mono)' }}>{a}</span>
+                        ))}
+                        {(eng.assets || []).length > 3 && (
+                          <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)' }}>
+                            +{eng.assets.length - 3} more
+                          </span>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </>
       )}
     </div>
-  );
-}
-
-function KPISmall({ label, value, color }: { label: string; value: number; color?: 'danger' | 'warning' }) {
-  const textColor = color === 'danger' ? 'text-error' : color === 'warning' ? 'text-warning' : 'text-on-surface';
-  return (
-    <Card className="p-3">
-      <p className="text-[10px] font-mono uppercase tracking-wider text-on-surface-variant/70 mb-1">{label}</p>
-      <p className={`text-2xl font-semibold ${textColor}`}>{value}</p>
-    </Card>
   );
 }

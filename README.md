@@ -58,19 +58,22 @@ AtlasOS/
 │   │   └── rca_agent.py          # Builds fault trees from descriptions
 │   ├── db/
 │   │   └── postgres.py           # Database models, schemas, and session configs
+│   ├── eval/                     # Evaluation Framework (accuracy & latency reports)
 │   ├── graph/
+│   │   ├── graph_analytics.py    # PageRank & Centrality algorithms
 │   │   ├── graph_builder.py      # Inserts nodes & relationships to Neo4j
-│   │   └── neo4j_client.py       # Queries Cypher properties
+│   │   └── neo4j_client.py       # Queries Cypher properties & handles bulk upserts
 │   ├── ingestion/
-│   │   ├── document_processor.py # Extracts text via PyMuPDF/Tesseract
-│   │   └── entity_extractor.py   # Extracts JSON entities using LLM
-│   ├── routers/
-│   │   ├── dashboard.py          # System stats & audit log feeds
-│   │   ├── engineers.py          # Person/Engineer node lookups
-│   │   └── risk.py               # Risk indexes & decay timelines
+│   │   ├── document_processor.py # Extracts text via PyMuPDF/Tesseract (PDF/DOCX/CSV/XLSX/PPTX)
+│   │   └── entity_extractor.py   # Extracts JSON entities using LLM (One-Call/Regex/Cache)
+│   ├── ontology/
+│   │   └── industrial_ontology.py# Industrial ontology definitions
+│   ├── retrieval/
+│   │   └── hybrid_retriever.py   # Retriever 3.0 (semantic vectors + BM25 keyword search)
+│   ├── routers/                  # Router endpoints (dashboard, engineers, analytics, health, risk)
 │   ├── tasks/
-│   │   ├── celery_app.py         # Broker, task registrations
-│   │   └── ingestion_tasks.py    # Process and delete background tasks
+│   │   ├── celery_app.py         # Celery broker & registration configs
+│   │   └── ingestion_tasks.py    # Process and delete background tasks (Celery DAG)
 │   └── app.py                    # FastAPI server declaration & middleware
 ├── frontend/                     # React 19 Vite Application
 │   ├── src/
@@ -118,16 +121,31 @@ This spins up:
     OPENROUTER_MODEL=anthropic/claude-3-haiku
     JWT_SECRET_KEY=generate_using_openssl_rand_hex_32
     ```
-3.  Start the Celery worker process:
+3.  Verify the connection health of postgres, qdrant, neo4j, and redis:
+    ```bash
+    python scripts/verify_databases.py
+    ```
+4.  (Optional) Bootstrap the database schema and ingest the demo dataset:
+    ```bash
+    python scripts/bootstrap_demo.py
+    ```
+5.  Start the Celery worker process:
     ```bash
     celery -A backend.tasks.celery_app worker --loglevel=info -P solo
     ```
-4.  Launch the FastAPI server:
+6.  Launch the FastAPI server:
     ```bash
     uvicorn backend.app:app --reload --port 8000
     ```
 
-### 3.3 Frontend Development Server
+### 3.3 Pipeline Evaluation Suite
+To run the full evaluation suite verifying retrieval recall, extraction fidelity, compliance checks, and latency:
+```bash
+python -m backend.eval
+```
+Report files will be saved in `backend/eval/results/`.
+
+### 3.4 Frontend Development Server
 1.  Navigate to the `frontend/` directory and install dependencies:
     ```bash
     cd frontend
@@ -144,7 +162,9 @@ This spins up:
 ## 4. Operational Features & API Schema
 
 *   **Dashboard (`/api/dashboard`)**: Single-source-of-truth endpoint aggregating document statistics, Neo4j node/edge counts, and Redis/Qdrant health statuses.
-*   **Copilot Chat (`/api/copilot/query`)**: streams hybrid RAG tokens, citation metadata, and matching Neo4j path layouts via Server-Sent Events (SSE).
-*   **RCA Investigation (`/api/rca/run`)**: state-machine parsing logs to build structured Ishikawa cause-trees.
-*   **Compliance (`/api/compliance/check`)**: audits documents against ISO/OSHA regulations and outputs checklist findings with Pass/Fail ratings.
-*   **Engineers (`/api/engineers`)**: tracks expert centrality indexes, succession risks, and sole-owned plant equipment.
+*   **Copilot Chat (`/api/copilot/query`)**: Streams hybrid RAG tokens, citation metadata, and matching Neo4j path layouts via Server-Sent Events (SSE). Incorporates query intent routing (classification), centrality-aware PageRank scoring, shortest path graph context extraction, and LLM fallback safety.
+*   **RCA Investigation (`/api/rca/run`)**: State-machine parsing logs to build structured Ishikawa cause-trees.
+*   **Compliance (`/api/compliance/check`)**: Audits documents against ISO/OSHA regulations and outputs checklist findings with Pass/Fail ratings.
+*   **Engineers (`/api/engineers`)**: Tracks expert centrality indexes, succession risks, and sole-owned plant equipment.
+*   **Graph Integrity Checker (`/api/system/integrity`)**: Cross-verifies database metadata, checking consistency across PostgreSQL, Qdrant vectors, and Neo4j nodes.
+*   **Duplicate Hash Check (`/api/upload/check`)**: Checks incoming SHA-256 hashes against existing documents for the active tenant, preventing redundant vector and graph processing.

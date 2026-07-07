@@ -1,211 +1,260 @@
 import logging
 import os as _sys_os
+import json
+import time as _time
+import redis
 from typing import Dict, Any, List
 
 from backend.tasks.celery_app import celery_app
 from backend.tasks.progress_tracker import progress_tracker
-from backend.db.postgres import SessionLocal, ProcessingJob, Document, Chunk, Entity
+from backend.db.postgres import SessionLocal, ProcessingJob, Document, Chunk, Entity, AuditLog
 from backend.ingestion.document_processor import process_document
-from backend.ingestion.entity_extractor import batch_extract_entities
+from backend.ingestion.entity_extractor import extract_entities_batched
 from backend.graph.graph_builder import build_graph_from_extraction
+from backend.graph.neo4j_client import neo4j_client as _neo4j_client
 from backend.vector.qdrant_client import qdrant_client
 from backend.config import get_settings
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-@celery_app.task(bind=True, max_retries=3)
-def process_document_task(self, job_id: str, tenant_id: str):
-    """
-    Main Celery task to process a document: text extraction, chunking, 
-    embedding, entity extraction, and graph building.
-    """
-    logger.info(f"Starting Celery task for job {job_id} (Tenant: {tenant_id})")
-    
-    db = SessionLocal()
-    job = db.query(ProcessingJob).filter(ProcessingJob.id == job_id, ProcessingJob.tenant_id == tenant_id).first()
-    
-    if not job:
-        logger.error(f"Job {job_id} not found for tenant {tenant_id}")
-        db.close()
-        return
-
-    job.status = "processing"
-    db.commit()
-    
-    doc = db.query(Document).filter(Document.id == job.document_id, Document.tenant_id == tenant_id).first()
-    if not doc:
-        job.status = "failed"
-        job.error = "Document not found"
-        db.commit()
-        db.close()
-        return
-
-    doc.status = "processing"
-    db.commit()
-    
+def publish_document_status(doc, tenant_id: str):
     try:
-        # 1. Extraction & Chunking
-        progress_tracker.update_stage(job_id, "text_extraction", 10)
-        chunks_data = process_document(
-            file_path=doc.file_path,
-            document_id=doc.id
-        )
-        
-        if not chunks_data:
-            raise ValueError("No text extracted from document")
-            
-        risk_chunks = [c for c in chunks_data if c.get("metadata", {}).get("has_risk_signal", False)]
-        has_high_risk_content = len(risk_chunks) > 0
-        section_types_found = list(set(c.get("metadata", {}).get("section_type", "general") for c in chunks_data))
-        
-        job.details = json.dumps({
-            "risk_signals_found": len(risk_chunks),
-            "has_high_risk_content": has_high_risk_content,
-            "section_types_found": section_types_found
-        })
-        db.commit()
-            
-        progress_tracker.init_job(job_id, len(chunks_data))
-        progress_tracker.update_stage(job_id, "vector_embedding", 20)
-        
-        # 2. Vector Database Upsert
-        # Convert to Qdrant format
-        qdrant_chunks = []
-        for i, chunk in enumerate(chunks_data):
-            qdrant_chunks.append({
-                "text": chunk["text"],
-                "doc_id": doc.id,
-                "page": chunk["page_number"],
-                "chunk_index": i,
-                "section_type": chunk.get("metadata", {}).get("section_type", "general"),
-                "has_risk_signal": chunk.get("metadata", {}).get("has_risk_signal", False),
-                "metadata": {"source_file": doc.filename}
-            })
-            
-        qdrant_ids = qdrant_client.upsert_chunks(
-            settings.QDRANT_COLLECTION_NAME, 
-            qdrant_chunks,
-            tenant_id=tenant_id
-        )
-        
-        # Verify Qdrant insertion
-        logger.info(f"Inserted {len(qdrant_chunks)} chunks into Qdrant")
-        
-        progress_tracker.update_progress_with_metadata(job_id, "vector_embedding", 20, {"chunks_embedded": len(qdrant_chunks)})
-        
-        # Save chunks to Postgres
-        for i, chunk in enumerate(chunks_data):
-            db_chunk = Chunk(
-                tenant_id=tenant_id,
-                document_id=doc.id,
-                page_number=chunk["page_number"],
-                chunk_index=i,
-                text_content=chunk["text"],
-                qdrant_id=qdrant_ids[i]
-            )
-            db.add(db_chunk)
-            
-        db.commit()
-        
-        # 3. Entity Extraction & Graph Building
-        progress_tracker.update_stage(job_id, "entity_extraction", 50)
-        
-        # Collect texts for batch extraction
-        texts = [c["text"] for c in chunks_data]
-        
-        # Run extraction
-        logger.info(f"Running entity extraction on {len(texts)} chunks for doc {doc.id}")
-        extraction_results = batch_extract_entities(texts, tenant_id=tenant_id)
-        
-        progress_tracker.update_stage(job_id, "graph_building", 80)
-        
-        # Consolidate entities and relationships across chunks
-        all_entities = []
-        all_relationships = []
-        for res in extraction_results:
-            all_entities.extend(res.get("entities", []))
-            all_relationships.extend(res.get("relationships", []))
-            
-        all_entities = [e for e in all_entities if e.get("confidence", 0.5) >= 0.35]
-        all_relationships = [r for r in all_relationships if r.get("confidence", 0.5) >= 0.40]
-        logger.info(f"After confidence filter: {len(all_entities)} entities, {len(all_relationships)} relationships")
-        
-        progress_tracker.update_progress_with_metadata(
-            job_id, "entity_extraction", 50,
-            {"entities_found": len(all_entities), "relationships_found": len(all_relationships)}
-        )
-            
-        # SAVE ENTITIES TO POSTGRESQL (CRITICAL FIX)
-        from backend.ingestion.entity_extractor import deduplicate_and_save_entities
-        logger.info(f"Saving {len(all_entities)} extracted entities to Postgres.")
-        deduplicate_and_save_entities(db, all_entities, doc.id, tenant_id)
-        db.commit()
+        r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+        r.publish(f"documents:{tenant_id}", json.dumps({
+            "event": "document_update",
+            "document": {
+                "id": doc.id,
+                "filename": doc.filename,
+                "status": doc.status,
+                "file_type": doc.file_type,
+                "upload_time": doc.upload_time.isoformat() if hasattr(doc.upload_time, 'isoformat') else str(doc.upload_time)
+            }
+        }))
+    except Exception as e:
+        logger.warning(f"Failed to publish document status to SSE: {e}")
 
-        # Publish events for live SSE frontend
-        try:
-            r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
-            for ent in all_entities:
-                r.publish(f"ingestion:{job_id}", json.dumps({
-                    "event": "entity_created",
-                    "data": {"id": ent["name"], "name": ent["name"], "label": ent["type"], "confidence": 1.0}
-                }))
-            for rel in all_relationships:
-                r.publish(f"ingestion:{job_id}", json.dumps({
-                    "event": "relationship_created",
-                    "data": {"source": rel["source"], "target": rel["target"], "type": rel["type"], "confidence": 1.0}
-                }))
-        except Exception as pub_err:
-            logger.warning(f"Failed to publish SSE events: {pub_err}")
 
-            
-        # Build Knowledge Graph
-        logger.info(f"Upserting {len(all_entities)} entities and {len(all_relationships)} relationships")
-        graph_stats = build_graph_from_extraction(all_entities, all_relationships, doc.id, tenant_id=tenant_id)
+def get_job_and_doc(db, job_id, tenant_id, document_id=None):
+    from backend.db.postgres import ProcessingJob, Document
+    job = db.query(ProcessingJob).filter(ProcessingJob.id == job_id, ProcessingJob.tenant_id == tenant_id).first()
+    if not job:
+        return None, None
+    doc_id = document_id or job.document_id
+    doc = db.query(Document).filter(Document.id == doc_id, Document.tenant_id == tenant_id).first()
+    return job, doc
+
+def set_status_and_publish(db, doc, status, tenant_id):
+    doc.status = status
+    db.commit()
+    publish_document_status(doc, tenant_id)
+
+@celery_app.task(bind=True, max_retries=3)
+def validate_task(self, job_id: str, tenant_id: str):
+    logger.info(f"[DAG] validate_task for {job_id}")
+    db = SessionLocal()
+    try:
+        job, doc = get_job_and_doc(db, job_id, tenant_id)
+        if not doc: return None
+        set_status_and_publish(db, doc, "validating", tenant_id)
+        # Validation logic (e.g. magic bytes) would go here
         
-        progress_tracker.update_progress_with_metadata(
-            job_id, "graph_building", 80,
-            {"nodes_created": graph_stats.get("nodes_created", 0), "edges_created": graph_stats.get("relationships_created", 0)}
-        )
-        
-        # Verify Neo4j insertion
-        try:
-            node_count = _neo4j_client.run_query("MATCH (n) RETURN count(n) as count")[0]["count"]
-            logger.info(f"Verified Neo4j insertion: total graph nodes is now {node_count}")
-        except Exception as e:
-            logger.warning(f"Failed to verify Neo4j node count: {e}")
-            
-        # Complete
-        job.status = "completed"
-        doc.status = "completed"
-        db.commit()
-        
-        progress_tracker.complete_job(job_id)
-        logger.info(f"Successfully completed job {job_id}. Graph stats: {graph_stats}")
-        
+        # Start timing for the overall job and parsing
+        return {
+            "job_id": job_id, 
+            "document_id": doc.id, 
+            "tenant_id": tenant_id,
+            "start_time": _time.time(),
+            "parse_start": _time.time()
+        }
     except Exception as e:
         db.rollback()
-        logger.error(f"Task failed: {e}", exc_info=True)
         job.status = "failed"
         job.error = str(e)
-        doc.status = "failed"
-        db.commit()
-        progress_tracker.fail_job(job_id, str(e))
-        
-        # Retry with exponential backoff if it's an API/Connection error
-        if "timeout" in str(e).lower() or "connection" in str(e).lower() or "50" in str(e):
-            raise self.retry(exc=e, countdown=2 ** self.request.retries)
-            
+        if 'doc' in locals() and doc: set_status_and_publish(db, doc, "failed", tenant_id)
+        raise self.retry(exc=e, countdown=5)
     finally:
         db.close()
 
-from backend.graph.neo4j_client import neo4j_client as _neo4j_client
-from backend.db.postgres import AuditLog
-import json as _json
-import redis
-import json
+@celery_app.task(bind=True, max_retries=3)
+def parse_and_chunk_task(self, prev: dict):
+    if not prev: return None
+    logger.info(f"[DAG] parse_and_chunk_task for {prev['job_id']}")
+    db = SessionLocal()
+    try:
+        job, doc = get_job_and_doc(db, prev['job_id'], prev['tenant_id'], prev['document_id'])
+        set_status_and_publish(db, doc, "parsing", prev['tenant_id'])
+        
+        chunks_data = process_document(file_path=doc.file_path, document_id=doc.id)
+        if not chunks_data:
+            raise ValueError("No text extracted from document")
+            
+        # Optional: update job details with risk signals
+        risk_chunks = [c for c in chunks_data if c.get("metadata", {}).get("has_risk_signal", False)]
+        job.details = json.dumps({"risk_signals_found": len(risk_chunks)})
+        
+        # Save chunks to DB without Qdrant ID first
+        db.query(Chunk).filter(Chunk.document_id == doc.id).delete()
+        for i, chunk in enumerate(chunks_data):
+            db.add(Chunk(
+                tenant_id=prev['tenant_id'], document_id=doc.id, page_number=chunk["page_number"],
+                chunk_index=i, text_content=chunk["text"],
+            ))
+        db.commit()
+        prev["parse_time_ms"] = (_time.time() - prev.get("parse_start", _time.time())) * 1000
+        prev["embed_start"] = _time.time()
+        return prev
+    except Exception as e:
+        db.rollback()
+        if 'job' in locals() and job: job.status = "failed"; job.error = str(e)
+        if 'doc' in locals() and doc: set_status_and_publish(db, doc, "failed", prev['tenant_id'])
+        raise self.retry(exc=e, countdown=5)
+    finally:
+        db.close()
 
-import time as _time
+@celery_app.task(bind=True, max_retries=3)
+def embed_task(self, prev: dict):
+    if not prev: return None
+    logger.info(f"[DAG] embed_task for {prev['job_id']}")
+    db = SessionLocal()
+    try:
+        job, doc = get_job_and_doc(db, prev['job_id'], prev['tenant_id'], prev['document_id'])
+        set_status_and_publish(db, doc, "embedding", prev['tenant_id'])
+        
+        db_chunks = db.query(Chunk).filter(Chunk.document_id == doc.id).all()
+        qdrant_chunks = []
+        for c in db_chunks:
+            qdrant_chunks.append({
+                "text": c.text_content, "doc_id": doc.id, "page": c.page_number, "chunk_index": c.chunk_index,
+                "metadata": {"source_file": doc.filename}
+            })
+        
+        qdrant_ids = qdrant_client.upsert_chunks(settings.QDRANT_COLLECTION_NAME, qdrant_chunks, tenant_id=prev['tenant_id'])
+        
+        for c, q_id in zip(db_chunks, qdrant_ids):
+            c.qdrant_id = q_id
+        db.commit()
+        
+        prev["embed_time_ms"] = (_time.time() - prev.get("embed_start", _time.time())) * 1000
+        prev["llm_start"] = _time.time()
+        return prev
+    except Exception as e:
+        db.rollback()
+        if 'job' in locals() and job: job.status = "failed"; job.error = str(e)
+        if 'doc' in locals() and doc: set_status_and_publish(db, doc, "failed", prev['tenant_id'])
+        raise self.retry(exc=e, countdown=5)
+    finally:
+        db.close()
+
+
+def _run_async(coro):
+    import asyncio
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            return asyncio.run_coroutine_threadsafe(coro, loop).result()
+    except RuntimeError:
+        pass
+    return asyncio.run(coro)
+
+@celery_app.task(bind=True, max_retries=3)
+def extract_entities_task(self, prev: dict):
+    if not prev: return None
+    logger.info(f"[DAG] extract_entities_task (bulk graph build) for {prev['job_id']}")
+    db = SessionLocal()
+    try:
+        job, doc = get_job_and_doc(db, prev['job_id'], prev['tenant_id'], prev['document_id'])
+        set_status_and_publish(db, doc, "entity_extraction", prev['tenant_id'])
+        
+        db_chunks = db.query(Chunk).filter(Chunk.document_id == doc.id).all()
+        texts = [c.text_content for c in db_chunks]
+        
+        from backend.ingestion.entity_extractor import extract_entities_one_call
+        full_text = "\n\n".join(texts)
+        result = extract_entities_one_call(full_text, tenant_id=prev['tenant_id'], doc_id=doc.id)
+        
+        entities = result.get("entities", [])
+        all_rels = result.get("relationships", [])
+        
+        from backend.graph.neo4j_client import neo4j_client as nc
+        stats = nc.bulk_upsert(
+            tenant_id=prev['tenant_id'],
+            entities=entities,
+            relationships=all_rels,
+        )
+        logger.info(
+            "Doc %s graph build: %d entities, %d rels, created %s",
+            doc.id, len(entities), len(all_rels), stats,
+        )
+        
+        prev["llm_time_ms"] = (_time.time() - prev.get("llm_start", _time.time())) * 1000
+        prev["graph_time_ms"] = 0 # Built inline with LLM task for now
+        return prev
+    except Exception as e:
+        db.rollback()
+        if 'job' in locals() and job: job.status = "failed"; job.error = str(e)
+        if 'doc' in locals() and doc: set_status_and_publish(db, doc, "failed", prev['tenant_id'])
+        raise self.retry(exc=e, countdown=10)
+    finally:
+        db.close()
+
+@celery_app.task(bind=True, max_retries=3)
+def extract_relationships_task(self, prev: dict):
+    # Skipped since entities task builds the whole graph now
+    return prev
+
+@celery_app.task(bind=True, max_retries=3)
+def graph_upsert_task(self, prev: dict):
+    # Skipped since entities task builds the whole graph now
+    return prev
+
+@celery_app.task(bind=True, max_retries=3)
+def quality_validation_task(self, prev: dict):
+    if not prev: return None
+    logger.info(f"[DAG] quality_validation_task for {prev['job_id']}")
+    db = SessionLocal()
+    try:
+        job, doc = get_job_and_doc(db, prev['job_id'], prev['tenant_id'], prev['document_id'])
+        set_status_and_publish(db, doc, "quality_validation", prev['tenant_id'])
+        
+        from backend.db.postgres import Entity, EntityRelationship
+        chunks_count = db.query(Chunk).filter(Chunk.document_id == doc.id).count()
+        entities_count = db.query(Entity).filter(Entity.source_doc_id == doc.id).count()
+        rels_count = db.query(EntityRelationship).filter(EntityRelationship.source_doc_id == doc.id).count()
+        
+        # Validation checks
+        if chunks_count == 0:
+            raise ValueError("Validation Failed: 0 chunks found in DB")
+            
+        metrics = {
+            "chunks_count": chunks_count,
+            "entities_count": entities_count,
+            "relationships_count": rels_count,
+        }
+        
+        from backend.db.postgres import ProcessingMetrics
+        total_time_ms = (_time.time() - prev.get('start_time', _time.time())) * 1000
+        metrics_record = ProcessingMetrics(
+            document_id=doc.id,
+            parse_time_ms=prev.get('parse_time_ms', 0),
+            embed_time_ms=prev.get('embed_time_ms', 0),
+            llm_time_ms=prev.get('llm_time_ms', 0),
+            graph_time_ms=prev.get('graph_time_ms', 0),
+            total_time_ms=total_time_ms
+        )
+        db.add(metrics_record)
+        
+        job.details = json.dumps(metrics)
+        job.status = "completed"
+        set_status_and_publish(db, doc, "completed", prev['tenant_id'])
+        return prev
+    except Exception as e:
+        db.rollback()
+        if 'job' in locals() and job: job.status = "failed"; job.error = str(e)
+        if 'doc' in locals() and doc: set_status_and_publish(db, doc, "failed", prev['tenant_id'])
+        raise self.retry(exc=e, countdown=5)
+    finally:
+        db.close()
 
 @celery_app.task(bind=True, max_retries=3)
 def delete_document_task(self, job_id: str, tenant_id: str, document_id: int, file_path: str):
@@ -226,43 +275,25 @@ def delete_document_task(self, job_id: str, tenant_id: str, document_id: int, fi
     job.status = "deleting"
     db.commit()
     
+    doc = db.query(Document).filter(Document.id == document_id, Document.tenant_id == tenant_id).first()
+    if doc:
+        doc.status = "deleting"
+        db.commit()
+        publish_document_status(doc, tenant_id)
+    
     try:
         progress_tracker.init_job(job_id, 100)
         
-        # 1. Qdrant Cleanup
-        progress_tracker.update_stage(job_id, "deleting_vectors", 20)
-        logger.info(f"Deleting vectors for doc_id {document_id}")
-        qdrant_client.delete_by_doc_id(settings.QDRANT_COLLECTION_NAME, document_id, tenant_id=tenant_id)
-        
-        # 2. Neo4j Cleanup - Relationships
-        progress_tracker.update_stage(job_id, "cleaning_graph_relationships", 40)
-        logger.info(f"Deleting relationships for doc_id {document_id}")
-        rel_query = """
-        MATCH ()-[r]->() 
-        WHERE r.source_doc_id = $doc_id AND r.tenant_id = $tenant_id 
-        DELETE r
-        """
-        _neo4j_client.run_query(rel_query, {'doc_id': document_id, 'tenant_id': tenant_id})
-        
-        # 3. Neo4j Cleanup - Orphan Nodes (Scoped)
-        progress_tracker.update_stage(job_id, "cleaning_graph_nodes", 60)
-        logger.info(f"Deleting orphan nodes for doc_id {document_id} tenant {tenant_id}")
-        node_query = """
-        MATCH (n) 
-        WHERE n.tenant_id = $tenant_id AND n.source_doc_id = $doc_id AND NOT (n)--() 
-        DELETE n
-        """
-        _neo4j_client.run_query(node_query, {'doc_id': document_id, 'tenant_id': tenant_id})
-        
-        # 4. Database Cleanup (Soft delete document, hard delete chunks/entities)
-        progress_tracker.update_stage(job_id, "finalizing_database", 80)
+        # 1. Database Cleanup (Flush but don't commit yet to allow rollback)
+        progress_tracker.update_stage(job_id, "finalizing_database", 20)
         doc = db.query(Document).filter(Document.id == document_id, Document.tenant_id == tenant_id).first()
+        filename = "Unknown Document"
         if doc:
             filename = doc.filename
             
             # Hard delete chunks and entities to free DB space
-            db.query(Chunk).filter(Chunk.document_id == document_id).delete()
-            db.query(Entity).filter(Entity.source_doc_id == document_id).delete()
+            db.query(Chunk).filter(Chunk.document_id == document_id).delete(synchronize_session=False)
+            db.query(Entity).filter(Entity.source_doc_id == document_id).delete(synchronize_session=False)
             
             # Soft delete the document
             doc.status = "deleted"
@@ -275,7 +306,7 @@ def delete_document_task(self, job_id: str, tenant_id: str, document_id: int, fi
                 actor_name="system_worker",
                 action="delete_document",
                 query_text=filename,
-                details=_json.dumps({
+                details=json.dumps({
                     "document_id": document_id, 
                     "document_name": filename,
                     "job_id": job_id,
@@ -284,10 +315,40 @@ def delete_document_task(self, job_id: str, tenant_id: str, document_id: int, fi
                 })
             )
             db.add(audit)
-            db.commit()
-            logger.info(f"Soft deleted Document row and hard deleted chunks/entities for doc_id {document_id}")
+            db.flush() # Hold the transaction open
+            logger.info(f"Staged DB deletes for doc_id {document_id}")
         else:
             logger.warning(f"Document {document_id} not found in DB.")
+
+        # 2. Qdrant Cleanup
+        progress_tracker.update_stage(job_id, "deleting_vectors", 40)
+        logger.info(f"Deleting vectors for doc_id {document_id}")
+        qdrant_client.delete_by_doc_id(settings.QDRANT_COLLECTION_NAME, document_id, tenant_id=tenant_id)
+        
+        # 3. Neo4j Cleanup - Relationships
+        progress_tracker.update_stage(job_id, "cleaning_graph_relationships", 60)
+        logger.info(f"Deleting relationships for doc_id {document_id}")
+        rel_query = """
+        MATCH ()-[r]->() 
+        WHERE r.source_doc_id = $doc_id AND r.tenant_id = $tenant_id 
+        DELETE r
+        """
+        _neo4j_client.run_query(rel_query, {'doc_id': document_id, 'tenant_id': tenant_id})
+        
+        # 4. Neo4j Cleanup - Orphan Nodes (Scoped)
+        progress_tracker.update_stage(job_id, "cleaning_graph_nodes", 80)
+        logger.info(f"Deleting orphan nodes for doc_id {document_id} tenant {tenant_id}")
+        node_query = """
+        MATCH (n) 
+        WHERE n.tenant_id = $tenant_id AND n.source_doc_id = $doc_id AND NOT (n)--() 
+        DELETE n
+        """
+        _neo4j_client.run_query(node_query, {'doc_id': document_id, 'tenant_id': tenant_id})
+        
+        # DB Commit: commit DB changes now that external systems succeeded
+        if doc:
+            db.commit()
+            publish_document_status(doc, tenant_id)
             
         # 5. File Cleanup (Absolute last step for debuggability)
         progress_tracker.update_stage(job_id, "removing_files", 90)
@@ -312,6 +373,10 @@ def delete_document_task(self, job_id: str, tenant_id: str, document_id: int, fi
         job.status = "failed"
         job.error = str(e)
         db.commit()
+        if 'doc' in locals() and doc:
+            doc.status = "failed"
+            db.commit()
+            publish_document_status(doc, tenant_id)
         progress_tracker.fail_job(job_id, str(e))
         
         if "timeout" in str(e).lower() or "connection" in str(e).lower():

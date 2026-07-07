@@ -115,6 +115,11 @@ desktop.ini
 !/uploads/.gitkeep
 /logs/
 *.log
+/profile_baseline.json
+/profile_*.json
+/backend/eval/results/*.json
+/backend/scripts/uploads/*
+!/backend/scripts/uploads/.gitkeep
 
 # --- Antigravity Scratch Files ---
 .gemini/

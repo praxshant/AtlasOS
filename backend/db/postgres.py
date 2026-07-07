@@ -65,6 +65,7 @@ class Document(Base):
     filename = Column(String, nullable=False)
     file_path = Column(String, unique=True, nullable=False)
     file_type = Column(String, nullable=False) # PDF, DOCX, TXT
+    file_hash = Column(String, nullable=True, index=True) # SHA-256 content hash
     status = Column(String, default="pending") # pending, processing, completed, failed
     source = Column(String, default="upload") # upload, api
     upload_time = Column(DateTime, default=datetime.utcnow)
@@ -73,6 +74,7 @@ class Document(Base):
     jobs = relationship("ProcessingJob", back_populates="document", cascade="all, delete-orphan")
     chunks = relationship("Chunk", back_populates="document", cascade="all, delete-orphan")
     entities = relationship("Entity", back_populates="document", cascade="all, delete-orphan")
+    relationships = relationship("EntityRelationship", back_populates="document", cascade="all, delete-orphan")
 
 
 class ProcessingJob(Base):
@@ -105,7 +107,7 @@ class Chunk(Base):
     page_number = Column(Integer, default=1)
     chunk_index = Column(Integer, nullable=False)
     text_content = Column(Text, nullable=False)
-    qdrant_id = Column(String, unique=True, nullable=False)
+    qdrant_id = Column(String, unique=True, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     document = relationship("Document", back_populates="chunks")
@@ -130,6 +132,26 @@ class Entity(Base):
     document = relationship("Document", back_populates="entities")
 
 
+class EntityRelationship(Base):
+    __tablename__ = "relationships"
+    __table_args__ = (
+        Index('ix_relationships_tenant', 'tenant_id'),
+        Index('ix_relationships_doc', 'source_doc_id'),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(String, ForeignKey("tenants.id"), nullable=False, index=True)
+    source_entity = Column(String, index=True, nullable=False)
+    target_entity = Column(String, index=True, nullable=False)
+    relationship_type = Column(String, nullable=False) # e.g. HAS_PART, RELATED_TO
+    confidence = Column(Float, default=1.0)
+    chunk_index = Column(Integer, nullable=True)
+    source_doc_id = Column(Integer, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    document = relationship("Document", back_populates="relationships")
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
     __table_args__ = (
@@ -148,6 +170,30 @@ class AuditLog(Base):
 
     tenant = relationship("Tenant", back_populates="audit_logs")
     user = relationship("User", back_populates="audit_logs")
+
+
+class CachedExtraction(Base):
+    __tablename__ = "cached_extractions"
+
+    id = Column(Integer, primary_key=True)
+    file_hash = Column(String, unique=True, index=True, nullable=False)
+    provider = Column(String, nullable=False)          # openrouter / ollama
+    llm_json = Column(Text, nullable=False)            # raw extraction JSON
+    version = Column(String, default="1.0")
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ProcessingMetrics(Base):
+    __tablename__ = "processing_metrics"
+    
+    id = Column(Integer, primary_key=True)
+    document_id = Column(Integer, ForeignKey("documents.id"))
+    parse_time_ms = Column(Float)
+    embed_time_ms = Column(Float)
+    llm_time_ms = Column(Float)
+    graph_time_ms = Column(Float)
+    total_time_ms = Column(Float)
+    created_at = Column(DateTime, default=datetime.utcnow)
 
 
 def ensure_default_tenant():

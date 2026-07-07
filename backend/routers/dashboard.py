@@ -119,6 +119,48 @@ def get_dashboard_full(
         "health": health
     }
 
+@router.get("/api/dashboard/summary")
+def get_dashboard_summary(
+    db: Session = Depends(get_db),
+    tenant_id: str = Depends(get_current_tenant_id)
+):
+    """
+    Unified endpoint for top-level dashboard metrics.
+    Aggregates data from Postgres, Neo4j, and Qdrant.
+    """
+    try:
+        from backend.db.postgres import Document, Chunk, Entity
+        docs_count = db.query(Document).filter(Document.tenant_id == tenant_id, Document.status == "completed").count()
+        chunks_count = db.query(Chunk).filter(Chunk.tenant_id == tenant_id).count()
+        assets_count = db.query(Entity).filter(Entity.tenant_id == tenant_id, Entity.entity_type.in_(["Asset", "Equipment"])).count()
+        
+        # Neo4j stats
+        graph_stats = neo4j_client.get_dashboard_stats(tenant_id)
+        
+        # Qdrant stats
+        try:
+            from backend.config import get_settings
+            settings = get_settings()
+            info = qdrant_client.get_client().get_collection(settings.QDRANT_COLLECTION_NAME)
+            qdrant_vectors = info.points_count
+        except:
+            qdrant_vectors = 0
+            
+        return {
+            "documents": docs_count,
+            "chunks": chunks_count,
+            "assets": assets_count,
+            "graph_nodes": graph_stats.get("graph_nodes", 0),
+            "graph_edges": graph_stats.get("graph_edges", 0),
+            "coverage": 85.5, # Placeholder for now
+            "critical_gaps": 0, # Placeholder for now
+            "engineers_at_risk": 0, # Placeholder for now
+            "qdrant_vectors": qdrant_vectors
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/api/copilot/suggestions")
 def get_copilot_suggestions(tenant_id: str = Depends(get_current_tenant_id)):
     """

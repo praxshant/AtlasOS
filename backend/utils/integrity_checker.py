@@ -96,9 +96,9 @@ def verify_graph_integrity(tenant_id: Optional[str] = None) -> Dict[str, Any]:
         try:
             neo4j_nodes = 0
             if tenant_id:
-                res = neo4j_client.run_query("MATCH (n) WHERE n.tenant_id = $tid RETURN count(n) as count, collect(n.name) as names", {"tid": tenant_id})
+                res = neo4j_client.run_query("MATCH (n) WHERE n.tenant_id = $tid AND NOT n:KnowledgeGap AND NOT n:MissingCategory AND NOT n:Subtype AND NOT n:Subclass RETURN count(n) as count, collect(n.name) as names", {"tid": tenant_id})
             else:
-                res = neo4j_client.run_query("MATCH (n) RETURN count(n) as count, collect(n.name) as names")
+                res = neo4j_client.run_query("MATCH (n) WHERE NOT n:KnowledgeGap AND NOT n:MissingCategory AND NOT n:Subtype AND NOT n:Subclass RETURN count(n) as count, collect(n.name) as names")
                 
             if res:
                 neo4j_nodes = res[0]["count"]

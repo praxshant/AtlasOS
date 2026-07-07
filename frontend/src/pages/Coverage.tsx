@@ -1,11 +1,24 @@
 import { useQuery } from '@tanstack/react-query';
 import { getJson } from '../api/client';
-import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/Card';
-import { Table, TableHeader, TableRow, TableHead, TableBody, TableCell } from '../components/ui/Table';
-import { Badge } from '../components/ui/Badge';
-import { Skeleton } from '../components/ui/Skeleton';
-import { Upload } from 'lucide-react';
-import { Link } from 'react-router-dom';
+import { BookOpen } from 'lucide-react';
+
+function StatusDot({ ok }: { ok: boolean }) {
+  return (
+    <span style={{
+      display: 'inline-block', width: 8, height: 8, borderRadius: '50%',
+      background: ok ? 'var(--status-ok)' : 'var(--status-danger)',
+      opacity: ok ? 1 : 0.4,
+    }} />
+  );
+}
+
+function riskBadge(level: string) {
+  const l = (level || '').toLowerCase();
+  if (l === 'critical') return 'badge-danger';
+  if (l === 'high') return 'badge-warn';
+  if (l === 'medium') return 'badge-info';
+  return 'badge-neutral';
+}
 
 export function Coverage() {
   const { data: gapsData, isLoading } = useQuery({
@@ -15,101 +28,102 @@ export function Coverage() {
 
   const gaps = gapsData?.gaps || [];
   const totalEquipment = gapsData?.total_equipment || 0;
-
-  if (isLoading) {
-    return (
-      <div className="space-y-5">
-        <h2 className="text-xl font-semibold tracking-tight">Knowledge Coverage</h2>
-        <Skeleton className="h-[400px] w-full" />
-      </div>
-    );
-  }
-
-  const covered = gaps.filter((g: any) => g.coverage_score >= 50).length;
+  const covered = gaps.filter((g: any) => (g.coverage_score ?? 0) >= 50).length;
   const critical = gaps.filter((g: any) => g.risk_level === 'Critical').length;
+  const avgCoverage = gaps.length > 0
+    ? Math.round(gaps.reduce((s: number, g: any) => s + (g.coverage_score || 0), 0) / gaps.length)
+    : 0;
 
   return (
-    <div className="space-y-5">
-      <h2 className="text-xl font-semibold tracking-tight">Knowledge Coverage</h2>
+    <div>
+      {/* Page Header */}
+      <div className="page-header">
+        <div>
+          <h1>Knowledge Coverage</h1>
+          <p className="page-subtitle">Asset documentation and SOP coverage analysis</p>
+        </div>
+        <BookOpen size={20} style={{ color: 'var(--accent)', opacity: 0.6 }} />
+      </div>
 
-      {totalEquipment === 0 ? (
-        <Card className="flex flex-col items-center justify-center py-16 text-center">
-          <div className="w-14 h-14 rounded-full bg-primary/10 flex items-center justify-center mb-4">
-            <Upload size={24} className="text-primary" />
+      {isLoading ? (
+        <>
+          <div className="stat-row" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
+            {[...Array(4)].map((_, i) => <div key={i} className="skeleton" style={{ height: 72 }} />)}
           </div>
-          <h3 className="text-lg font-semibold mb-2">No assets found</h3>
-          <p className="text-sm text-on-surface-variant max-w-md mb-6">
-            Upload industrial documents to extract assets and compute knowledge coverage scores.
-          </p>
-          <Link to="/documents" className="px-4 py-2 bg-primary text-on-primary rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors">
-            Upload Documents
-          </Link>
-        </Card>
+          <div className="skeleton" style={{ height: 400 }} />
+        </>
+      ) : totalEquipment === 0 ? (
+        <div className="card">
+          <div className="empty-state">
+            <BookOpen size={28} style={{ opacity: 0.3 }} />
+            <span>No assets found. Upload industrial documents to extract assets and compute coverage scores.</span>
+          </div>
+        </div>
       ) : (
         <>
-          <div className="grid grid-cols-3 gap-3">
-            <KPISmall label="Total Assets" value={totalEquipment} />
-            <KPISmall label="Covered" value={covered} color="success" />
-            <KPISmall label="Critical Risk" value={critical} color="danger" />
+          {/* Stats */}
+          <div className="stat-row" style={{ gridTemplateColumns: 'repeat(4, 1fr)' }}>
+            <div className="card"><div className="stat-block"><span className="stat-value">{totalEquipment}</span><span className="stat-label">Total Assets</span></div></div>
+            <div className="card"><div className="stat-block"><span className="stat-value" style={{ color: 'var(--status-ok)' }}>{covered}</span><span className="stat-label">Well Covered</span></div></div>
+            <div className="card"><div className="stat-block"><span className="stat-value" style={{ color: 'var(--status-danger)' }}>{critical}</span><span className="stat-label">Critical Risk</span></div></div>
+            <div className="card"><div className="stat-block"><span className="stat-value">{avgCoverage}%</span><span className="stat-label">Avg Coverage</span></div></div>
           </div>
 
-          <Card>
-            <CardContent className="p-0">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Asset</TableHead>
-                    <TableHead>Risk Level</TableHead>
-                    <TableHead>Risk Score</TableHead>
-                    <TableHead>Coverage</TableHead>
-                    <TableHead>SOP</TableHead>
-                    <TableHead>Maintenance</TableHead>
-                    <TableHead>Expert</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {gaps.map((gap: any, i: number) => (
-                    <TableRow key={i}>
-                      <TableCell className="font-medium text-sm">{gap.asset || gap.equipment}</TableCell>
-                      <TableCell>
-                        <Badge variant={gap.risk_level === 'Critical' ? 'danger' : gap.risk_level === 'High' ? 'warning' : 'default'}>
-                          {gap.risk_level}
-                        </Badge>
-                      </TableCell>
-                      <TableCell className="font-mono text-xs">{(gap.risk_score || 0).toFixed(2)}</TableCell>
-                      <TableCell>
-                        <div className="flex items-center gap-2">
-                          <div className="w-16 bg-surface-variant rounded-full h-1">
-                            <div className="bg-primary h-1 rounded-full" style={{ width: `${gap.coverage_score || 0}%` }} />
+          {/* Coverage Table */}
+          <div className="card">
+            <div className="card-header" style={{ flexDirection: 'column', alignItems: 'flex-start', gap: 'var(--space-2)' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', width: '100%' }}>
+                <h3>Asset Coverage Matrix</h3>
+                <span className="page-header-meta">{gaps.length} assets</span>
+              </div>
+              <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', background: 'var(--bg-layer-2)', padding: 'var(--space-2)', borderRadius: 'var(--radius)', width: '100%' }}>
+                <strong>Coverage Formula:</strong> SOP (25%) + Incident History (20%) + Maintenance (20%) + Compliance (20%) + Expert Owner (15%)
+              </div>
+            </div>
+            <table className="data-table">
+              <thead>
+                <tr>
+                  <th>Asset</th>
+                  <th>Risk Level</th>
+                  <th>Risk Score</th>
+                  <th>Coverage</th>
+                  <th style={{ textAlign: 'center' }}>SOP</th>
+                  <th style={{ textAlign: 'center' }}>Maintenance</th>
+                  <th style={{ textAlign: 'center' }}>Incident</th>
+                  <th style={{ textAlign: 'center' }}>Compliance</th>
+                  <th style={{ textAlign: 'center' }}>Expert</th>
+                </tr>
+              </thead>
+              <tbody>
+                {gaps.map((gap: any, i: number) => {
+                  const score = gap.coverage_score || 0;
+                  const fillCls = score >= 80 ? 'ok' : score >= 50 ? '' : 'danger';
+                  return (
+                    <tr key={i}>
+                      <td className="doc-name">{gap.asset || gap.equipment}</td>
+                      <td><span className={`badge ${riskBadge(gap.risk_level)}`}>{gap.risk_level}</span></td>
+                      <td className="text-mono text-tertiary">{(gap.risk_score || 0).toFixed(2)}</td>
+                      <td>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+                          <div className="inline-bar" style={{ width: 64 }}>
+                            <div className={`inline-bar-fill ${fillCls}`} style={{ width: `${score}%` }} />
                           </div>
-                          <span className="text-[10px] font-mono text-on-surface-variant">{gap.coverage_score || 0}%</span>
+                          <span className="text-mono text-tertiary" style={{ fontSize: 'var(--text-xs)' }}>{score}%</span>
                         </div>
-                      </TableCell>
-                      <TableCell><StatusDot ok={gap.has_sop} /></TableCell>
-                      <TableCell><StatusDot ok={gap.has_maintenance} /></TableCell>
-                      <TableCell><StatusDot ok={gap.has_expert} /></TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </CardContent>
-          </Card>
+                      </td>
+                      <td style={{ textAlign: 'center' }}><StatusDot ok={gap.has_sop} /></td>
+                      <td style={{ textAlign: 'center' }}><StatusDot ok={gap.has_maintenance} /></td>
+                      <td style={{ textAlign: 'center' }}><StatusDot ok={gap.has_incident_history} /></td>
+                      <td style={{ textAlign: 'center' }}><StatusDot ok={gap.has_compliance} /></td>
+                      <td style={{ textAlign: 'center' }}><StatusDot ok={gap.has_expert} /></td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         </>
       )}
     </div>
-  );
-}
-
-function StatusDot({ ok }: { ok: boolean }) {
-  return <div className={`w-2 h-2 rounded-full mx-auto ${ok ? 'bg-success' : 'bg-error/50'}`} />;
-}
-
-function KPISmall({ label, value, color }: { label: string; value: number; color?: 'success' | 'danger' }) {
-  const textColor = color === 'success' ? 'text-success' : color === 'danger' ? 'text-error' : 'text-on-surface';
-  return (
-    <Card className="p-3">
-      <p className="text-[10px] font-mono uppercase tracking-wider text-on-surface-variant/70 mb-1">{label}</p>
-      <p className={`text-2xl font-semibold ${textColor}`}>{value}</p>
-    </Card>
   );
 }

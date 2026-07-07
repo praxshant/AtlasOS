@@ -25,8 +25,11 @@ from backend.agents.lessons_agent import lessons_agent
 
 # Import routers
 from backend.routers.risk import router as risk_router
+from backend.routers.analytics import router as analytics_router
+from backend.routers.graph_health import router as graph_health_router
 from backend.routers.dashboard import router as dashboard_router
 from backend.routers.engineers import router as engineers_router
+from backend.routers.ingestion_health import router as ingestion_health_router
 
 # Import security and authentication
 from backend.utils.auth import (
@@ -39,7 +42,6 @@ from backend.utils.auth import (
 )
 
 # Import Celery Tasks and Progress Tracker
-from backend.tasks.ingestion_tasks import process_document_task
 from backend.tasks.progress_tracker import progress_tracker
 
 # Import logging configuration
@@ -173,9 +175,12 @@ def startup():
     threading.Thread(target=_run_integrity, daemon=True).start()
 
 # Register sub-routers
+app.include_router(analytics_router)
+app.include_router(graph_health_router)
 app.include_router(dashboard_router)
 app.include_router(risk_router, prefix="/api/risk", tags=["Risk Analytics"])
 app.include_router(engineers_router, prefix="/api/engineers", tags=["Engineers"])
+app.include_router(ingestion_health_router)
 
 
 class UserRegister(BaseModel):
@@ -305,6 +310,33 @@ def log_audit(db: Session, user: User, action: str, query_text: Optional[str] = 
 
 # --- File Ingestion Endpoints ---
 
+from pydantic import BaseModel
+from typing import List
+class HashCheckRequest(BaseModel):
+    hashes: List[str]
+
+@app.post("/api/upload/check")
+async def check_duplicate_hashes(
+    request: HashCheckRequest,
+    db: Session = Depends(get_db),
+    tenant_id: str = Depends(get_current_tenant_id)
+):
+    """
+    Accepts a list of SHA-256 hashes and returns a list of hashes that already exist
+    for this tenant, so the frontend can skip uploading duplicate files.
+    """
+    if not request.hashes:
+        return {"existing_hashes": []}
+        
+    existing = db.query(Document.file_hash).filter(
+        Document.tenant_id == tenant_id,
+        Document.file_hash.in_(request.hashes),
+        Document.status.notin_(["deleted", "deleting", "failed", "failed_delete"])
+    ).all()
+    
+    return {"existing_hashes": [r[0] for r in existing if r[0]]}
+
+
 @app.post("/api/upload", status_code=status.HTTP_202_ACCEPTED)
 async def upload_document(
     file: UploadFile = File(...),
@@ -312,7 +344,7 @@ async def upload_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(check_role(["admin", "engineer"])),
     tenant_id: str = Depends(get_current_tenant_id),
-    _ = Depends(rate_limit(5, 60))
+    _ = Depends(rate_limit(60, 60))
 ):
     """
     Saves document file to disk, creates PostgreSQL status trackers, and pushes job to Redis.
@@ -337,6 +369,23 @@ async def upload_document(
             detail=f"File size exceeds limit of {settings.MAX_UPLOAD_SIZE_MB}MB."
         )
 
+    # 3. Calculate SHA-256 hash for duplicate detection
+    import hashlib
+    file_hash = hashlib.sha256(content).hexdigest()
+
+    # 4. Check for duplicates (same tenant, same content, not deleted/failed)
+    existing_doc = db.query(Document).filter(
+        Document.tenant_id == tenant_id,
+        Document.file_hash == file_hash,
+        Document.status.notin_(["deleted", "deleting", "failed", "failed_delete"])
+    ).first()
+
+    if existing_doc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"A file with identical content already exists as '{existing_doc.filename}'."
+        )
+
     # Save file
     file_id = str(uuid.uuid4())
     save_filename = f"{file_id}_{filename}"
@@ -358,6 +407,7 @@ async def upload_document(
         filename=filename,
         file_path=save_path,
         file_type=file_ext.strip(".").upper(),
+        file_hash=file_hash,
         status="pending",
         source=source
     )
@@ -378,10 +428,26 @@ async def upload_document(
     # Log Audit
     log_audit(db, current_user, "upload_document", filename, {"document_id": db_doc.id, "job_id": job_id})
 
-    # Push to Celery queue
+    # Push to Celery DAG State Machine
     try:
-        process_document_task.delay(job_id, tenant_id)
-        logger.info(f"Dispatched Celery task for document job {job_id} (Tenant: {tenant_id})")
+        from celery import chain
+        from backend.tasks.ingestion_tasks import (
+            validate_task, parse_and_chunk_task, embed_task, extract_entities_task, 
+            extract_relationships_task, graph_upsert_task, quality_validation_task
+        )
+        
+        workflow = chain(
+            validate_task.s(job_id, tenant_id),
+            parse_and_chunk_task.s(),
+            embed_task.s(),
+            extract_entities_task.s(),
+            extract_relationships_task.s(),
+            graph_upsert_task.s(),
+            quality_validation_task.s()
+        )
+        workflow.apply_async()
+        
+        logger.info(f"Dispatched Celery DAG for document job {job_id} (Tenant: {tenant_id})")
     except Exception as e:
         logger.error(f"Failed to dispatch to Celery: {e}")
         # Mark failed immediately
@@ -393,6 +459,23 @@ async def upload_document(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to queue document processing."
         )
+
+    # Publish to SSE
+    try:
+        import redis
+        r = redis.Redis.from_url(settings.CELERY_BROKER_URL)
+        r.publish(f"documents:{tenant_id}", json.dumps({
+            "event": "document_update",
+            "document": {
+                "id": db_doc.id,
+                "filename": filename,
+                "status": "pending",
+                "file_type": file_ext.strip(".").upper(),
+                "upload_time": db_doc.upload_time.isoformat()
+            }
+        }))
+    except Exception as e:
+        logger.warning(f"Failed to publish SSE event for upload: {e}")
 
     return {
         "message": "Upload accepted and enqueued.",
@@ -498,6 +581,38 @@ def get_documents(
         "source": d.source
     } for d in docs]
 
+@app.get("/api/documents/stream")
+async def stream_documents(
+    tenant_id: str = Depends(get_current_tenant_id)
+):
+    """
+    Server-Sent Events endpoint to stream document status updates in real-time.
+    """
+    async def event_generator():
+        try:
+            import redis.asyncio as aioredis
+            import asyncio
+            r = aioredis.from_url(settings.CELERY_BROKER_URL)
+            pubsub = r.pubsub()
+            await pubsub.subscribe(f"documents:{tenant_id}")
+            
+            while True:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message:
+                    data = message['data'].decode('utf-8')
+                    yield f"data: {data}\n\n"
+                else:
+                    yield ": keep-alive\n\n"
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if 'pubsub' in locals():
+                await pubsub.unsubscribe()
+                await pubsub.close()
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
 # --- Stats & Graph Data Endpoints ---
 
 @app.get("/api/system/integrity")
@@ -527,7 +642,12 @@ def get_system_stats(
         Document.tenant_id == tenant_id,
         Document.status.notin_(["deleted", "deleting", "failed", "failed_delete"])
     ).count()
-    chunk_count = db.query(Chunk).filter(Chunk.tenant_id == tenant_id).count()
+    
+    chunk_count = db.query(Chunk).join(Document, Chunk.document_id == Document.id).filter(
+        Chunk.tenant_id == tenant_id,
+        Document.status.notin_(["deleted", "deleting", "failed", "failed_delete"])
+    ).count()
+    
     entity_count = db.query(Entity).filter(Entity.tenant_id == tenant_id).count()
     active_jobs = db.query(ProcessingJob).filter(
         ProcessingJob.tenant_id == tenant_id,
@@ -754,6 +874,52 @@ def expand_graph_node(
     except Exception as e:
         logger.error(f"Failed to expand node {node_name}: {e}")
         return {"nodes": [], "edges": []}
+
+@app.post("/api/graph/analyze")
+def analyze_graph(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(get_current_tenant_id),
+    _ = Depends(rate_limit(10, 60))
+):
+    """
+    Triggers the Advanced Graph Reasoning engine (Centrality, Communities).
+    """
+    from backend.services.graph_analytics import graph_analytics
+    
+    log_audit(db, current_user, "analyze_graph")
+    try:
+        # In a real system, this would be a background Celery task
+        # We run it inline here per Phase 7 requirements for simplicity unless configured otherwise
+        result = graph_analytics.run_full_analytics()
+        return result
+    except Exception as e:
+        logger.error(f"Failed to run graph analytics: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/graph/shortest-path")
+def get_shortest_path(
+    source: str,
+    target: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    tenant_id: str = Depends(get_current_tenant_id),
+    _ = Depends(rate_limit(60, 60))
+):
+    """
+    Calculates the shortest structural path between two nodes.
+    """
+    from backend.services.graph_analytics import graph_analytics
+    
+    log_audit(db, current_user, "get_shortest_path", f"{source} -> {target}")
+    try:
+        path = graph_analytics.calculate_shortest_path(source, target)
+        if not path:
+            return {"path": [], "found": False}
+        return {"path": path, "found": True}
+    except Exception as e:
+        logger.error(f"Failed to calculate shortest path: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # --- Agent Query Request Schemas ---

@@ -49,7 +49,7 @@ def get_risk_assets(
     WHERE sop IN sops
     WITH a, incident_count, wo_count, proc_count, gap_count, retiring_experts, collect(distinct coalesce(d.updated_at, d.created_at)) as dates
     
-    RETURN a.name as name, labels(a)[0] as label, incident_count, wo_count, proc_count, gap_count, retiring_experts, dates
+    RETURN a.name as name, labels(a)[0] as label, incident_count, wo_count, proc_count, gap_count, retiring_experts, dates, coalesce(a.pagerank, 0.0) as pagerank, a.community_id as community_id
     """
     
     results_raw = neo4j_client.run_query(query, {"tenant_id": tenant_id})
@@ -67,11 +67,17 @@ def get_risk_assets(
         gaps = row["gap_count"]
         retiring_experts = row.get("retiring_experts") or []
         dates = row.get("dates") or []
+        pagerank = row.get("pagerank", 0.0)
+        community_id = row.get("community_id", -1)
         
         # Risk heuristic (sync with knowledge_service.py)
         score = (incidents * 15) + (wos * 5) + (gaps * 10)
         if procs == 0:
             score += 20
+            
+        # Graph Analytics: Highly connected structural nodes carry more systemic risk
+        pr_boost = min(30, pagerank * 200) # Arbitrary scaling to add up to 30 points
+        score += pr_boost
             
         score = min(100, score)
             
@@ -94,6 +100,8 @@ def get_risk_assets(
             reasons.append(f"No active procedures")
         if wos > 0:
             reasons.append(f"{wos} active work orders")
+        if pr_boost > 15:
+            reasons.append(f"High systemic connectivity (Hub)")
             
         top_reason = " + ".join(reasons) if reasons else "Low documentation coverage"
 
@@ -144,7 +152,9 @@ def get_risk_assets(
                 "incident_count_2yr": incidents,
                 "gap_count": gaps,
                 "retiring_experts": retiring_experts,
-                "sop_age_days": sop_age_days
+                "sop_age_days": sop_age_days,
+                "pagerank": round(pagerank, 4),
+                "community_id": community_id
             },
             "top_risk_reason": top_reason,
             "recommended_action": recommended_action,

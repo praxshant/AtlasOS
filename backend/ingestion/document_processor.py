@@ -23,6 +23,21 @@ def extract_text_from_pdf(file_path: str) -> List[Dict[str, Any]]:
         doc = fitz.open(file_path)
         for page_idx, page in enumerate(doc):
             text = page.get_text()
+            
+            # Extract tables as structured text
+            try:
+                tables = page.find_tables()
+                for table in tables:
+                    table_text = []
+                    for row in table.extract():
+                        clean_row = [str(cell).strip().replace("\n", " ") for cell in row if cell is not None]
+                        if any(clean_row):
+                            table_text.append(" | ".join(clean_row))
+                    if table_text:
+                        text += "\n\n[TABLE DATA]\n" + "\n".join(table_text)
+            except Exception:
+                pass
+
             if not text.strip():
                 text = f"[Image/Scanned Page - OCR Not Available for page {page_idx + 1}]"
             pages_data.append({
@@ -281,10 +296,12 @@ def semantic_chunk_section(section: Dict[str, Any], max_words: int = 200, overla
     Chunk a single section with word-count limit and overlap.
     """
     text = section["text"]
+    heading = section.get("heading")
     paragraphs = re.split(r'\n\n+', text)
     
     chunks = []
-    current_chunk_words = []
+    current_chunk_sentences = []
+    current_word_count = 0
     
     for para in paragraphs:
         para = para.strip()
@@ -294,24 +311,49 @@ def semantic_chunk_section(section: Dict[str, Any], max_words: int = 200, overla
         
         for sentence in sentences:
             sentence_words = sentence.split()
-            if len(current_chunk_words) + len(sentence_words) > max_words and current_chunk_words:
-                chunk_text = " ".join(current_chunk_words)
-                chunks.append({
-                    "text": chunk_text,
-                    "section_type": section["section_type"],
-                    "has_risk_signal": section["has_risk_signal"]
-                })
-                current_chunk_words = current_chunk_words[-overlap_words:] + sentence_words
-            else:
-                current_chunk_words.extend(sentence_words)
+            sentence_word_count = len(sentence_words)
+            
+            if current_word_count + sentence_word_count > max_words and current_chunk_sentences:
+                chunk_text = " ".join(current_chunk_sentences)
+                if heading:
+                    chunk_text = f"[{heading}]\n" + chunk_text
                 
-    if current_chunk_words:
-        chunk_text = " ".join(current_chunk_words)
-        chunks.append({
-            "text": chunk_text,
-            "section_type": section["section_type"],
-            "has_risk_signal": section["has_risk_signal"]
-        })
+                # Minimum chunk length filter (5 words)
+                if len(chunk_text.split()) >= 5:
+                    chunks.append({
+                        "text": chunk_text,
+                        "heading": heading,
+                        "section_type": section["section_type"],
+                        "has_risk_signal": section["has_risk_signal"]
+                    })
+                
+                # Backtrack for overlap (keep sentences until we have at least overlap_words)
+                overlap_sentences = []
+                overlap_count = 0
+                for s in reversed(current_chunk_sentences):
+                    overlap_sentences.insert(0, s)
+                    overlap_count += len(s.split())
+                    if overlap_count >= overlap_words:
+                        break
+                        
+                current_chunk_sentences = overlap_sentences + [sentence]
+                current_word_count = overlap_count + sentence_word_count
+            else:
+                current_chunk_sentences.append(sentence)
+                current_word_count += sentence_word_count
+                
+    if current_chunk_sentences:
+        chunk_text = " ".join(current_chunk_sentences)
+        if heading:
+            chunk_text = f"[{heading}]\n" + chunk_text
+            
+        if len(chunk_text.split()) >= 5:
+            chunks.append({
+                "text": chunk_text,
+                "heading": heading,
+                "section_type": section["section_type"],
+                "has_risk_signal": section["has_risk_signal"]
+            })
         
     return chunks
 
@@ -333,6 +375,7 @@ def chunk_text(text: str, page_number: int, start_idx: int = 0, chunk_size: int 
                 page=page_number,
                 chunk_index=current_idx,
                 metadata={
+                    "heading": s_chunk.get("heading"),
                     "section_type": s_chunk["section_type"],
                     "has_risk_signal": s_chunk["has_risk_signal"]
                 }

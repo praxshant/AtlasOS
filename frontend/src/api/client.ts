@@ -36,6 +36,13 @@ export async function authenticatedFetch(endpoint: string, options: RequestInit 
   });
 
   if (!response.ok) {
+    if (response.status === 401) {
+      localStorage.removeItem('token');
+      sessionStorage.removeItem('token');
+      window.location.href = '/login';
+      throw new ApiError(401, null, 'Session expired. Please log in again.');
+    }
+
     let errorData = null;
     try {
       errorData = await response.json();

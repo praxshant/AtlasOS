@@ -73,10 +73,11 @@ def retrieve_incidents_node(state: RCAState) -> Dict[str, Any]:
     """
     desc = state["incident_description"]
     tenant_id = state.get("tenant_id")
-    logger.info("[RCA Agent] Retrieving similar incidents from Qdrant...")
+    logger.info("[RCA Agent] Retrieving similar incidents from Hybrid Retriever...")
     try:
+        from backend.retrieval.hybrid_retriever import hybrid_retriever
         # Fetch more to allow post-filtering by section_type
-        all_chunks = qdrant_client.similarity_search("document_chunks", desc, top_k=15, tenant_id=tenant_id)
+        all_chunks = hybrid_retriever.retrieve(desc, tenant_id=tenant_id, query_type="incident")
         similar = []
         for chunk in all_chunks:
             sec_type = chunk.get("metadata", {}).get("section_type", "general")
@@ -101,6 +102,18 @@ def retrieve_history_node(state: RCAState) -> Dict[str, Any]:
         try:
             subgraph = neo4j_client.get_multihop_subgraph(start_names=[asset_name], max_depth=2, limit=200, tenant_id=tenant_id)
             history_str = summarize_subgraph_for_prompt(subgraph.get("nodes", []), subgraph.get("edges", []))
+            
+            # Graph Analytics: Get actual failure paths from Neo4j Yen's algorithm
+            failure_mode = parsed.get("failure_mode")
+            if failure_mode:
+                try:
+                    from backend.services.graph_analytics import graph_analytics
+                    paths = graph_analytics.calculate_shortest_path(source_id=failure_mode, target_id=asset_name)
+                    if paths:
+                        history_str += "\n\nGraph Derived Failure Path:\n" + " -> ".join(paths)
+                except Exception as ex:
+                    logger.warning(f"Failed to get failure paths: {ex}")
+            
             logger.info(f"[RCA Agent] Extracted multihop graph history for {asset_name}.")
         except Exception as e:
             logger.error(f"Failed Neo4j multihop lookup: {e}")
@@ -195,7 +208,11 @@ def synthesis_node(state: RCAState) -> Dict[str, Any]:
     Evidence collected:
     {evidence_str}
     
-    Your task is to analyze this data and generate a JSON Root Cause Analysis report matching exactly this schema:
+    Your task is to analyze this data and generate a JSON Root Cause Analysis report matching exactly this schema.
+    IMPORTANT: The Graph context now includes Graph Analytics Centrality Metrics (PageRank, Betweenness). 
+    Use PageRank to identify highly connected structural failure points, and Betweenness to identify bottlenecks or critical paths in the system's failure chain. Mention these metrics in the causal tree if relevant.
+    
+    Schema:
     {{
       "mode": "rca",
       "incident_title": "Short title of the incident",
@@ -208,12 +225,19 @@ def synthesis_node(state: RCAState) -> Dict[str, Any]:
         "Why 5: [Root Cause]"
       ],
       "contributing_factors": ["Factor 1", "Factor 2"],
+      "graph_failure_chain": [
+        {{"from": "Entity A", "rel": "CAUSED_BY", "to": "Entity B", "confidence": 0.92}}
+      ],
+      "similar_incidents": [
+        {{"equipment": "Asset ID", "failure_mode": "...", "year": "2023", "outcome": "..."}}
+      ],
+      "counterfactual": "If X had been done according to the maintenance history, this failure could have been prevented...",
       "corrective_actions": [
         "Action 1",
         "Action 2"
       ],
       "knowledge_gaps": ["Missing SOP for X", "No maintenance record for Y"],
-      "similar_incidents_count": {len(similar)}
+      "confidence": 85
     }}
     
     Return the response strictly as a JSON block. Avoid any conversational text or markdown wrappers.

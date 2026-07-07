@@ -1,0 +1,83 @@
+{
+  "retrieval_queries": [
+    {
+      "query": "Why did Pump P-101 fail?",
+      "query_type": "incident",
+      "expected_keywords": ["seal", "leak", "P-101", "bearing", "vibration", "pump"],
+      "expected_entity_ids": ["P-101"],
+      "irrelevant_keywords": ["compressor", "electrical", "reactor"]
+    },
+    {
+      "query": "What are the maintenance steps for Compressor C-17?",
+      "query_type": "procedure",
+      "expected_keywords": ["maintenance", "compressor", "c-17", "procedure", "inspection"],
+      "expected_entity_ids": ["C-17"],
+      "irrelevant_keywords": ["pump", "incident"]
+    },
+    {
+      "query": "Who is the expert on the Cooling Water System?",
+      "query_type": "engineer",
+      "expected_keywords": ["engineer", "cooling", "water", "system", "kumar"],
+      "expected_entity_ids": ["Cooling Water System"],
+      "irrelevant_keywords": ["procedure", "pump"]
+    }
+  ],
+  "entity_extraction_cases": [
+    {
+      "text": "Pump P-101 in the Cooling Water System failed due to bearing seizure on 2024-01-15. Maintenance engineer Rahul Kumar reported the incident.",
+      "expected_entities": [
+        {"name": "P-101", "type": "Equipment"},
+        {"name": "Cooling Water System", "type": "System"},
+        {"name": "Bearing Seizure", "type": "FailureMode"},
+        {"name": "Rahul Kumar", "type": "Person"},
+        {"name": "Incident", "type": "Incident"}
+      ],
+      "expected_relationships": [
+        {"source": "P-101", "target": "Bearing Seizure", "type": "AFFECTED_BY"},
+        {"source": "P-101", "target": "Cooling Water System", "type": "PART_OF"},
+        {"source": "Rahul Kumar", "target": "Incident", "type": "REPORTED_BY"}
+      ]
+    },
+    {
+      "text": "According to OSHA 1910.119, all pressure vessels like V-200 must have pressure relief valves installed. An inspection by R. Kumar confirmed compliance.",
+      "expected_entities": [
+        {"name": "OSHA 1910.119", "type": "Regulation"},
+        {"name": "V-200", "type": "Equipment"},
+        {"name": "R. Kumar", "type": "Person"}
+      ],
+      "expected_relationships": [
+        {"source": "V-200", "target": "OSHA 1910.119", "type": "GOVERNED_BY"},
+        {"source": "R. Kumar", "target": "V-200", "type": "INSPECTED_BY"}
+      ]
+    }
+  ],
+  "copilot_qa_pairs": [
+    {
+      "query": "What maintenance procedures apply to Pump P-101?",
+      "must_cite_entities": ["P-101"],
+      "must_not_hallucinate": ["turbine", "reactor"],
+      "expected_answer_keywords": ["maintenance", "procedure", "pump", "p-101"]
+    },
+    {
+      "query": "Why did C-17 trip?",
+      "must_cite_entities": ["C-17"],
+      "must_not_hallucinate": ["boiler", "p-101"],
+      "expected_answer_keywords": ["trip", "c-17", "compressor"]
+    }
+  ],
+  "rca_cases": [
+    {
+      "incident_description": "Compressor C-17 tripped due to high discharge temperature and excessive vibration.",
+      "expected_root_causes": ["cooling system failure", "bearing wear", "lubrication", "temperature"],
+      "expected_fault_tree_depth": 3
+    }
+  ],
+  "compliance_cases": [
+    {
+      "document_text": "All pressure vessels are equipped with relief valves rated to 150 PSI. Hydrostatic testing is performed annually. Emergency stops are not hardwired.",
+      "regulation_scope": "OSHA 1910.119",
+      "expected_compliant_clauses": ["osha-1", "osha-2"],
+      "expected_non_compliant_clauses": ["iso-1"]
+    }
+  ]
+}
