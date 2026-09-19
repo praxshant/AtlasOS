@@ -1,13 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException
-from typing import List
+from fastapi import APIRouter, Depends
 from datetime import datetime, timedelta
-import json
-from pydantic import BaseModel
 
 from backend.db.postgres import get_db
-from backend.utils.auth import get_current_user, get_current_tenant_id
+from backend.utils.auth import get_current_tenant_id
 from backend.graph.neo4j_client import neo4j_client
-from backend.vector.qdrant_client import qdrant_client
 from backend.config import get_settings
 
 router = APIRouter()

@@ -1,15 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List
 from sqlalchemy.orm import Session
-from backend.db.postgres import get_db, User, AuditLog, Document, ProcessingJob
-from backend.utils.auth import get_current_user, get_current_tenant_id
+from backend.db.postgres import get_db, AuditLog, Document
+from backend.utils.auth import get_current_tenant_id
 from backend.graph.neo4j_client import neo4j_client
 from backend.vector.qdrant_client import qdrant_client
 from fastapi.responses import StreamingResponse
 import json
 import asyncio
-from datetime import datetime, timedelta
 
 router = APIRouter()
 
@@ -183,7 +182,7 @@ def get_copilot_suggestions(tenant_id: str = Depends(get_current_tenant_id)):
             """
             MATCH (n)
             WHERE n.tenant_id = $tenant_id AND n.name IS NOT NULL
-            WITH n, labels(n)[0] AS label, size([(n)--()]) AS degree
+            WITH n, labels(n)[0] AS label, count { (n)--() } AS degree
             ORDER BY degree DESC
             LIMIT 6
             RETURN n.name AS name, label

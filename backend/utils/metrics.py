@@ -1,4 +1,3 @@
-import time
 import logging
 import redis
 from backend.config import get_settings

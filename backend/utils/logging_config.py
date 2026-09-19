@@ -1,6 +1,5 @@
 import contextvars
 import logging
-from typing import Optional
 
 # Context variable to hold the correlation ID for the current request context
 correlation_id_var = contextvars.ContextVar("correlation_id", default="")

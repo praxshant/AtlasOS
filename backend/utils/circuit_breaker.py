@@ -10,7 +10,7 @@ States:
 import time
 import logging
 import threading
-from typing import Callable, Any, Optional
+from typing import Callable, Any
 from enum import Enum
 
 logger = logging.getLogger(__name__)

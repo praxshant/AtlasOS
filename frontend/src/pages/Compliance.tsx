@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { getJson, authenticatedFetch } from '../api/client';
-import { ShieldCheck, Play, Loader2, AlertTriangle, CheckCircle } from 'lucide-react';
+import { ShieldCheck, Play, Loader2, AlertTriangle, CheckCircle, HelpCircle } from 'lucide-react';
 
 function severityBadge(severity: string) {
   const s = (severity || '').toLowerCase();
@@ -125,10 +125,16 @@ export function Compliance() {
       {/* Results */}
       {results.map((r) => {
         const docName = documents.find((d: any) => d.id === r.document_id)?.filename || `Document ${r.document_id}`;
-        const gapCount = r.gaps?.length ?? 0;
-        const hasCritical = r.gaps?.some((g: any) => g.risk_level === 'Critical' || g.risk_level === 'High');
-        const statusLabel = gapCount === 0 ? 'PASS' : hasCritical ? 'FAIL' : 'PARTIAL';
-        const statusCls = gapCount === 0 ? 'badge-ok' : hasCritical ? 'badge-danger' : 'badge-warn';
+        const gapsListForStatus = r.evaluations ? r.evaluations.filter((e: any) => e.status !== 'COMPLIANT') : (r.gaps || []);
+        const gapCount = gapsListForStatus.length > 0 ? gapsListForStatus.length : (r.gap_count ?? 0);
+        const hasCritical = gapsListForStatus.some((g: any) => g.risk_level === 'Critical' || g.risk_level === 'High');
+        // Prefer backend-provided status, fall back to legacy gap-based logic
+        const backendStatus: string = r.status || (gapCount === 0 ? 'PASS' : hasCritical ? 'FAIL' : 'PARTIAL');
+        const statusLabel = backendStatus;
+        const statusCls =
+          backendStatus === 'INCOMPLETE' ? 'badge-warn' :
+          backendStatus === 'PASS' ? 'badge-ok' :
+          backendStatus === 'FAIL' ? 'badge-danger' : 'badge-warn';
 
         return (
           <div key={r.document_id} className="card" style={{ marginBottom: 'var(--space-6)' }}>
@@ -159,8 +165,18 @@ export function Compliance() {
               </div>
             </div>
 
-            {/* Gap Table */}
-            {gapCount === 0 ? (
+            {/* Gap Table / Status Block */}
+            {backendStatus === 'INCOMPLETE' ? (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 'var(--space-3)',
+                padding: 'var(--space-4)', background: 'rgba(234,179,8,0.08)',
+                border: '1px solid rgba(234,179,8,0.4)', borderRadius: 5,
+                color: 'rgb(234,179,8)', fontSize: 'var(--text-sm)',
+              }}>
+                <HelpCircle size={16} />
+                <span>{r.status_reason || 'No applicable regulations could be evaluated for this document. This is not a validated compliance pass.'}</span>
+              </div>
+            ) : gapCount === 0 ? (
               <div style={{
                 display: 'flex', alignItems: 'center', gap: 'var(--space-3)',
                 padding: 'var(--space-4)', background: 'var(--status-ok-dim)',
@@ -182,17 +198,20 @@ export function Compliance() {
                   </tr>
                 </thead>
                 <tbody>
-                  {r.gaps.map((gap: any, i: number) => (
-                    <tr key={i}>
-                      <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent)', fontSize: 'var(--text-xs)', whiteSpace: 'nowrap' }}>
-                        {gap.regulation}
-                      </td>
-                      <td style={{ color: 'var(--text-primary)', fontSize: 'var(--text-sm)', maxWidth: 200 }}>{gap.requirement}</td>
-                      <td style={{ color: 'var(--text-secondary)', fontSize: 'var(--text-sm)', maxWidth: 220 }}>{gap.finding}</td>
-                      <td><span className={`badge ${severityBadge(gap.risk_level)}`}>{gap.risk_level}</span></td>
-                      <td style={{ color: 'var(--text-secondary)', fontSize: 'var(--text-sm)', maxWidth: 240 }}>{gap.recommendation}</td>
-                    </tr>
-                  ))}
+                  {(() => {
+                    const gapsList = r.evaluations ? r.evaluations.filter((e: any) => e.status !== 'COMPLIANT') : (r.gaps || []);
+                    return gapsList.map((gap: any, i: number) => (
+                      <tr key={i}>
+                        <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent)', fontSize: 'var(--text-xs)', whiteSpace: 'nowrap' }}>
+                          {gap.regulation || gap.clause_id || 'Unknown'}
+                        </td>
+                        <td style={{ color: 'var(--text-primary)', fontSize: 'var(--text-sm)', maxWidth: 200 }}>{gap.requirement}</td>
+                        <td style={{ color: 'var(--text-secondary)', fontSize: 'var(--text-sm)', maxWidth: 220 }}>{gap.finding || gap.missing_evidence}</td>
+                        <td><span className={`badge ${severityBadge(gap.risk_level)}`}>{gap.risk_level}</span></td>
+                        <td style={{ color: 'var(--text-secondary)', fontSize: 'var(--text-sm)', maxWidth: 240 }}>{gap.recommendation}</td>
+                      </tr>
+                    ));
+                  })()}
                 </tbody>
               </table>
             )}

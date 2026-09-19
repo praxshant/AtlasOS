@@ -35,6 +35,12 @@ AtlasOS is an enterprise-grade **Industrial Knowledge Operating System (IKOS)** 
                                  │
                                  ▼
       ┌────────────────────────────────────────────────────────┐
+      │             Enterprise AI Execution Layer              │
+      │ (AI Planner → Semantic Cache → Ollama ⇄ Cloud Gateway) │
+      └──────────────────────────┬─────────────────────────────┘
+                                 │
+                                 ▼
+      ┌────────────────────────────────────────────────────────┐
       │      Unified App Layer (Dashboard, RCA, Compliance)    │
       └────────────────────────────────────────────────────────┘
 ```
@@ -64,8 +70,14 @@ AtlasOS/
 │   │   ├── graph_builder.py      # Inserts nodes & relationships to Neo4j
 │   │   └── neo4j_client.py       # Queries Cypher properties & handles bulk upserts
 │   ├── ingestion/
-│   │   ├── document_processor.py # Extracts text via PyMuPDF/Tesseract (PDF/DOCX/CSV/XLSX/PPTX)
-│   │   └── entity_extractor.py   # Extracts JSON entities using LLM (One-Call/Regex/Cache)
+│   │   ├── document_processor.py # Extracts text via PyMuPDF/Tesseract
+│   │   └── entity_extractor.py   # Extracts JSON entities using AI Planner
+│   ├── llm/                      # Enterprise AI Execution Layer
+│   │   ├── providers/            # Cloud & Local Providers (Ollama, OpenAI, Anthropic, Gemini, Groq, OpenRouter)
+│   │   ├── planner.py            # AI Execution Planner & Router
+│   │   ├── cache.py              # Semantic Caching
+│   │   ├── registry.yaml         # Fallback & Routing Registry
+│   │   └── metrics.py            # Latency & Provider Metrics tracking
 │   ├── ontology/
 │   │   └── industrial_ontology.py# Industrial ontology definitions
 │   ├── retrieval/
@@ -117,8 +129,13 @@ This spins up:
     NEO4J_PASSWORD=password123
     QDRANT_URL=http://localhost:6333
     REDIS_URL=redis://localhost:6379/0
+    LLM_PROVIDER=openrouter
+    OLLAMA_URL=http://localhost:11434
+    ENABLE_LOCAL_FIRST=true
     OPENROUTER_API_KEY=your_openrouter_api_key
-    OPENROUTER_MODEL=anthropic/claude-3-haiku
+    OPENROUTER_MODEL=openrouter/free
+    ANTHROPIC_API_KEY=
+    OPENAI_API_KEY=
     JWT_SECRET_KEY=generate_using_openssl_rand_hex_32
     ```
 3.  Verify the connection health of postgres, qdrant, neo4j, and redis:

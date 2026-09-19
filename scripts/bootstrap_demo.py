@@ -6,7 +6,7 @@ from sqlalchemy import text
 
 # App imports
 from backend.config import get_settings
-from backend.db.postgres import SessionLocal, init_db, Tenant, Document, Chunk, Entity, ProcessingJob, User
+from backend.db.postgres import SessionLocal, init_db, Tenant, Document, Chunk, Entity, ProcessingJob, User, ProcessingMetrics
 from backend.graph.neo4j_client import neo4j_client
 from backend.vector.qdrant_client import qdrant_client
 from backend.utils.auth import hash_password
@@ -28,6 +28,7 @@ def clear_existing_data(db):
         # Delete related chunks, entities, and jobs
         db.query(Chunk).filter(Chunk.document_id.in_(doc_ids)).delete(synchronize_session=False)
         db.query(Entity).filter(Entity.source_doc_id.in_(doc_ids)).delete(synchronize_session=False)
+        db.query(ProcessingMetrics).filter(ProcessingMetrics.document_id.in_(doc_ids)).delete(synchronize_session=False)
         db.query(ProcessingJob).filter(ProcessingJob.document_id.in_(doc_ids)).delete(synchronize_session=False)
         db.query(Document).filter(Document.id.in_(doc_ids)).delete(synchronize_session=False)
     

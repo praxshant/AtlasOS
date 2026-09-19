@@ -42,6 +42,9 @@ env/
 active_env/
 conda-meta/
 
+tests/
+scripts/
+
 # --- Python Testing & Coverage ---
 .pytest_cache/
 .tox/

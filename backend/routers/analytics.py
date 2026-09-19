@@ -1,6 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, HTTPException
 from typing import Dict, Any, List
-from pydantic import BaseModel
 
 from backend.graph.graph_analytics import graph_analytics
 

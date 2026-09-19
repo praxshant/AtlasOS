@@ -1,8 +1,7 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter
 import redis
 from datetime import datetime
 from backend.config import get_settings
-from backend.utils.auth import get_current_user
 
 router = APIRouter()
 

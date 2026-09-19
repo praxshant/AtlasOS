@@ -1,5 +1,4 @@
 from fastapi import APIRouter, Depends, HTTPException
-from typing import List, Dict, Any
 from backend.utils.auth import get_current_tenant_id
 from backend.graph.neo4j_client import neo4j_client
 
