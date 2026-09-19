@@ -2,15 +2,15 @@
 services:
   postgres:
     image: postgres:15-alpine
-    container_name: atlasos-postgres
+    container_name: atlasos-verol-postgres
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: atlasos
     ports:
-      - "5432:5432"
+      - "55432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data_verol:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d atlasos"]
       interval: 10s
@@ -20,27 +20,27 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest
-    container_name: atlasos-qdrant
+    container_name: atlasos-verol-qdrant
     ports:
-      - "6333:6333"
-      - "6334:6334"
+      - "6335:6333"
+      - "6336:6334"
     volumes:
-      - qdrant_data:/qdrant/storage
+      - qdrant_data_verol:/qdrant/storage
     restart: always
 
   neo4j:
     image: neo4j:5.12-community
-    container_name: atlasos-neo4j
+    container_name: atlasos-verol-neo4j
     ports:
-      - "7474:7474" # HTTP
-      - "7687:7687" # Bolt
+      - "7475:7474" # HTTP
+      - "7688:7687" # Bolt
     environment:
       - NEO4J_AUTH=neo4j/password123
       - NEO4J_PLUGINS=["apoc"]
     volumes:
-      - neo4j_data:/data
-      - neo4j_import:/import
-      - neo4j_plugins:/plugins
+      - neo4j_data_verol:/data
+      - neo4j_import_verol:/import
+      - neo4j_plugins_verol:/plugins
     healthcheck:
       test: ["CMD-SHELL", "cypher-shell -u neo4j -p password123 'RETURN 1'"]
       interval: 15s
@@ -50,9 +50,9 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: atlasos-redis
+    container_name: atlasos-verol-redis
     ports:
-      - "6379:6379"
+      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -61,8 +61,8 @@ services:
     restart: always
 
 volumes:
-  postgres_data:
-  qdrant_data:
-  neo4j_data:
-  neo4j_import:
-  neo4j_plugins:
+  postgres_data_verol:
+  qdrant_data_verol:
+  neo4j_data_verol:
+  neo4j_import_verol:
+  neo4j_plugins_verol:

@@ -5,9 +5,9 @@ from typing import TypedDict, List, Dict, Any, Generator
 
 from langgraph.graph import StateGraph, END
 
-from backend.vector.qdrant_client import qdrant_client
 from backend.graph.neo4j_client import neo4j_client
-from backend.utils.llm_client import stream_complete
+from backend.llm.planner import planner
+from backend.memory.memory_manager import memory_manager
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +31,20 @@ class CopilotState(TypedDict):
 def planning_node(state: CopilotState) -> Dict[str, Any]:
     from backend.retrieval.hybrid_retriever import hybrid_retriever
     query = state["query"]
+    history = state.get("history", [])
+    
+    # Simple prompt to contextualize query based on history if it has pronouns
+    if history and any(p in query.lower() for p in ["it", "this", "that", "he", "she", "they"]):
+        context_prompt = f"History: {json.dumps(history[-2:])}\n\nRewrite this query to be fully self-contained without pronouns: {query}"
+        try:
+            res = planner.generate(task="contextualize", prompt=context_prompt, max_tokens=100)
+            if res and len(res) > 5 and res.lower() != query.lower():
+                logger.info(f"[Copilot Agent] Contextualized query from '{query}' to '{res}'")
+                query = res
+                state["query"] = query  # mutate state
+        except Exception as e:
+            logger.warning(f"Failed to contextualize query: {e}")
+            
     classification = hybrid_retriever.classify_query(query)
     query_type = classification["query_type"]
     equipment_ids = classification["equipment_ids"]
@@ -38,7 +52,8 @@ def planning_node(state: CopilotState) -> Dict[str, Any]:
     return {
         "planning_info": f"Plan: Parallel semantic search and KG entity retrieval for query '{query}'",
         "query_type": query_type,
-        "equipment_ids": equipment_ids
+        "equipment_ids": equipment_ids,
+        "query": query
     }
 
 def query_decomposition_node(state: CopilotState) -> Dict[str, Any]:
@@ -52,13 +67,12 @@ def query_decomposition_node(state: CopilotState) -> Dict[str, Any]:
 
     complexity_indicators = ["and", "who", "what", "when", "where", "which", "related to", "connected to"]
     word_count = len(query.split())
-    has_complexity = any(indicator in query.lower() for indicator in complexity_indicators) and word_count > 8
+    has_complexity = any(indicator in query.lower() for indicator in complexity_indicators) and word_count > 15
 
     if not has_complexity:
         return {"sub_queries": [query]}
 
     try:
-        from backend.utils.llm_client import structured_complete
         decompose_prompt = f"""
         Decompose this complex question into 2-3 simpler sub-questions that can be searched independently.
         
@@ -67,7 +81,7 @@ def query_decomposition_node(state: CopilotState) -> Dict[str, Any]:
         Return JSON: {{"sub_queries": ["sub-question 1", "sub-question 2"]}}
         Keep each sub-question focused on a single entity or relationship.
         """
-        result = structured_complete(decompose_prompt)
+        result = planner.structured(task="complex_reasoning", prompt=decompose_prompt)
         sub_queries = result.get("sub_queries", [query])
         if not sub_queries:
             sub_queries = [query]
@@ -82,7 +96,11 @@ def retrieve_vector_node(state: CopilotState) -> Dict[str, Any]:
     tenant_id = state.get("tenant_id")
     query_type = state.get("query_type", "general")
     
-    # Metadata routing: bypass Qdrant and query Postgres directly
+    # Metadata and Entity Lookup routing: bypass Qdrant
+    if query_type == "entity_lookup":
+        logger.info("[Copilot Agent] Routed entity_lookup query to bypass vector search.")
+        return {"retrieved_chunks": []}
+        
     if query_type == "metadata":
         try:
             from backend.db.postgres import SessionLocal, Document
@@ -301,15 +319,40 @@ workflow.add_edge("synthesis", END)
 
 compiled_copilot_graph = workflow.compile()
 
+def compute_confidence(chunks: List[Dict[str, Any]], graph_nodes: List[Dict[str, Any]], query_type: str) -> int:
+    """Deterministically compute confidence score based on retrieval evidence."""
+    score = 0
+    if not chunks and not graph_nodes:
+        return 0
+        
+    if query_type in ["entity_lookup", "metadata"]:
+        return 95 if graph_nodes else (80 if chunks else 0)
+        
+    if chunks:
+        score += 40
+        high_score_chunks = sum(1 for c in chunks if c.get("rerank_score", 0) > 0.75)
+        score += min(30, high_score_chunks * 10)
+        
+    if graph_nodes:
+        score += 20
+        exact_matches = sum(1 for n in graph_nodes if n.get("confidence", 0) == 1.0)
+        score += min(10, exact_matches * 5)
+        
+    return min(100, max(0, score))
+
 
 class CopilotAgent:
-    def run_stream(self, query: str, history: List[Dict[str, Any]] = None, tenant_id: str = "default") -> Generator[Any, None, None]:
+    def run_stream(self, query: str, history: List[Dict[str, Any]] = None, tenant_id: str = "default", session_id: str = None) -> Generator[Any, None, None]:
         """
         Runs the retrieval nodes to assemble context, and streams the LLM synthesis.
         Yields tokens, citations, and graph evidence. Scoped to tenant.
         """
         from backend.config import get_settings
         settings = get_settings()
+
+        # Pull history from memory manager if session_id provided
+        if session_id and not history:
+            history = memory_manager.get_session_history(session_id)
 
         initial_state = {
             "query": query,
@@ -324,18 +367,26 @@ class CopilotAgent:
         }
 
         # Execute nodes and stream stage events
-        yield {"type": "stage", "stage": "vector_search", "status": "running"}
+        yield {"type": "stage", "stage": "intent_detection", "status": "running"}
         initial_state.update(planning_node(initial_state))
+        query_type = initial_state.get("query_type", "general")
+        yield {"type": "stage", "stage": "intent_detection", "status": "done", "detail": f"Query type: {query_type}"}
+
         initial_state.update(query_decomposition_node(initial_state))
+        
+        if query_type not in ["entity_lookup", "metadata"]:
+            yield {"type": "stage", "stage": "vector_search", "status": "running", "detail": "Searching semantic documents..."}
+        
         initial_state.update(retrieve_vector_node(initial_state))
 
         chunks = initial_state.get("retrieved_chunks", [])
-        yield {"type": "stage", "stage": "vector_search", "status": "done", "count": len(chunks)}
+        if query_type not in ["entity_lookup", "metadata"]:
+            yield {"type": "stage", "stage": "vector_search", "status": "done", "count": len(chunks), "detail": f"Found {len(chunks)} chunks"}
 
-        yield {"type": "stage", "stage": "graph_search", "status": "running"}
+        yield {"type": "stage", "stage": "graph_search", "status": "running", "detail": "Finding graph nodes..."}
         initial_state.update(retrieve_graph_node(initial_state))
         graph = initial_state.get("retrieved_graph", {"nodes": [], "edges": []})
-        yield {"type": "stage", "stage": "graph_search", "status": "done", "count": len(graph.get("nodes", []))}
+        yield {"type": "stage", "stage": "graph_search", "status": "done", "count": len(graph.get("nodes", [])), "detail": f"Found {len(graph.get('nodes', []))} nodes"}
 
         # -----------------------------------------------------------------
         # EMPTY CONTEXT GUARD: If both Qdrant and Neo4j return nothing,
@@ -419,31 +470,43 @@ class CopilotAgent:
 
         gap_lines = []
         expert_lines = []
-        for seed in seed_names[:5]:
-            node_label = next(
-                (n.get("label", "") for n in graph.get("nodes", []) if n.get("name") == seed),
-                ""
-            )
-            if node_label in ("Asset", "Equipment") or any(
-                kw in seed.upper() for kw in ("PUMP", "REACTOR", "VALVE", "VESSEL", "TANK", "COMPRESSOR", "BOILER")
-            ):
-                try:
-                    gap = neo4j_client.compute_knowledge_gaps(seed, tenant_id=tenant_id)
-                    gap_lines.append(
-                        f"- {seed}: {gap['coverage_pct']}% coverage  "
-                        f"| Missing: {', '.join(gap['missing']) if gap['missing'] else 'None'}"
-                    )
-                except Exception as _ge:
-                    logger.debug(f"Gap analysis skipped for {seed}: {_ge}")
-            elif node_label == "Person":
-                try:
-                    exp = neo4j_client.get_engineer_expertise(seed, tenant_id=tenant_id)
-                    expert_lines.append(
-                        f"- {seed}: expertise_score={exp['expertise_score']}/100  "
-                        f"| equipment={exp['equipment_touched']}"
-                    )
-                except Exception as _ee:
-                    logger.debug(f"Expertise analysis skipped for {seed}: {_ee}")
+        if query_type in ["asset", "engineer", "general", "risk", "incident"]:
+            yield {"type": "stage", "stage": "analysis", "status": "running", "detail": "Computing knowledge coverage..."}
+            for seed in seed_names[:5]:
+                node = next((n for n in graph.get("nodes", []) if n.get("name") == seed), {})
+                node_label = node.get("label", "")
+                
+                if node_label in ("Asset", "Equipment") or any(
+                    kw in seed.upper() for kw in ("PUMP", "REACTOR", "VALVE", "VESSEL", "TANK", "COMPRESSOR", "BOILER")
+                ):
+                    coverage_pct = node.get("coverage_pct")
+                    missing = node.get("missing_knowledge", [])
+                    if coverage_pct is None:
+                        try:
+                            gap = neo4j_client.compute_knowledge_gaps(seed, tenant_id=tenant_id)
+                            coverage_pct = gap['coverage_pct']
+                            missing = gap['missing']
+                        except Exception as _ge:
+                            logger.debug(f"Gap analysis skipped for {seed}: {_ge}")
+                            
+                    if coverage_pct is not None:
+                        gap_lines.append(f"- {seed}: {coverage_pct}% coverage | Missing: {', '.join(missing) if missing else 'None'}")
+                        
+                elif node_label == "Person":
+                    expertise_score = node.get("expertise_score")
+                    touched = node.get("equipment_touched", [])
+                    if expertise_score is None:
+                        try:
+                            exp = neo4j_client.get_engineer_expertise(seed, tenant_id=tenant_id)
+                            expertise_score = exp['expertise_score']
+                            touched = exp['equipment_touched']
+                        except Exception as _ee:
+                            logger.debug(f"Expertise analysis skipped for {seed}: {_ee}")
+                            
+                    if expertise_score is not None:
+                        expert_lines.append(f"- {seed}: expertise_score={expertise_score}/100 | equipment={touched}")
+
+            yield {"type": "stage", "stage": "analysis", "status": "done", "detail": "Analysis complete"}
 
         if gap_lines:
             context_text += "Knowledge Coverage Analysis:\n" + "\n".join(gap_lines) + "\n\n"
@@ -533,6 +596,16 @@ RULES:
 
 {type_instruction}"""
 
+        computed_conf_dict = neo4j_client.aggregate_confidence(seed_names, tenant_id=tenant_id)
+        computed_conf = computed_conf_dict.get("score")
+        if computed_conf is None:
+            computed_conf = compute_confidence(chunks, graph.get("nodes", []), query_type)
+            computed_conf_basis = "Fallback structural metric"
+        else:
+            computed_conf_basis = computed_conf_dict.get("reason", "Graph aggregate confidence")
+        # Fix 5: Do NOT tell the LLM what confidence value to emit. Python owns this.
+        # The confidence field will be overwritten after the LLM call completes.
+
         # 3. Stream the LLM answer
         prompt = f"Operational History:\n{json.dumps(history or [])}\n\nUser Question: {query}\n\nContext:\n{context_text}"
 
@@ -541,11 +614,68 @@ RULES:
         logger.info(prompt)
         logger.info("=" * 80)
 
+        # Check cache (P3)
+        from backend.llm.answer_cache import get_cached_answer, set_cached_answer
+        cached = get_cached_answer(tenant_id, query)
+        if cached:
+            yield {"type": "stage", "stage": "generating", "status": "running"}
+            logger.info("Streaming cached answer...")
+            # We cached the full JSON text, so we can yield it entirely as a token chunk or word by word
+            text = cached.get("text", "")
+            # Yield in smaller chunks to simulate streaming for the UI
+            chunk_size = 50
+            for i in range(0, len(text), chunk_size):
+                yield {"type": "token", "content": text[i:i+chunk_size]}
+            yield {"type": "stage", "stage": "generating", "status": "done"}
+            return
+
         yield {"type": "stage", "stage": "generating", "status": "running"}
         try:
-            token_stream = stream_complete(prompt, system_prompt=system_prompt)
+            token_stream = planner.stream(task="copilot", prompt=prompt, system_prompt=system_prompt)
+            full_response = ""
             for token in token_stream:
-                yield token
+                if isinstance(token, dict) and token.get("type") == "token":
+                    full_response += token.get("content", "")
+                # Don't yield individual tokens yet — buffer the whole response first
+                # so we can sanitize chain-of-thought before sending to the client.
+
+            # Fix 6: Sanitize the full response before streaming to client.
+            # 1. Strip <think>...</think> blocks (some models emit these)
+            full_response = re.sub(r'<think>.*?</think>', '', full_response, flags=re.DOTALL)
+            # 2. Discard everything before the first '{' (chain-of-thought prose)
+            brace_idx = full_response.find('{')
+            if brace_idx > 0:
+                logger.warning(f"Stripped {brace_idx} chars of pre-JSON content from Copilot response")
+                full_response = full_response[brace_idx:]
+            # 3. Discard everything after the last '}'
+            last_brace = full_response.rfind('}')
+            if last_brace >= 0 and last_brace < len(full_response) - 1:
+                full_response = full_response[:last_brace + 1]
+
+            # Fix 5: Overwrite confidence with the Python-computed value
+            try:
+                parsed = json.loads(full_response)
+                parsed["confidence"] = computed_conf
+                parsed["confidence_basis"] = computed_conf_basis
+                full_response = json.dumps(parsed)
+            except json.JSONDecodeError:
+                logger.warning("Copilot response was not valid JSON after sanitization — using as-is")
+
+            # Cache and stream the sanitized response
+            if full_response and len(full_response) > 50:
+                set_cached_answer(tenant_id, query, {"text": full_response})
+                if session_id:
+                    memory_manager.add_interaction(
+                        session_id=session_id, 
+                        query=initial_state.get("query", query), 
+                        answer=parsed.get("summary", ""),
+                        reasoning_path=parsed.get("reasoning_chain", [])
+                    )
+            # Stream in chunks so the UI still gets incremental tokens
+            chunk_size = 50
+            for i in range(0, len(full_response), chunk_size):
+                yield {"type": "token", "content": full_response[i:i + chunk_size]}
+                
         except Exception as e:
             logger.error(f"LLM generation failed: {e}")
             fallback_response = {

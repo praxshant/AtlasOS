@@ -7,8 +7,8 @@ from backend.utils.circuit_breaker import get_all_breaker_statuses
 from backend.db.postgres import SessionLocal
 from backend.graph.neo4j_client import neo4j_client
 from backend.vector.qdrant_client import qdrant_client
-from backend.utils.llm_client import get_client as get_llm_client
-
+from backend.llm.factory import get_provider_instance
+from backend.config import get_settings
 logger = logging.getLogger(__name__)
 
 class HealthMonitor:
@@ -91,19 +91,21 @@ class HealthMonitor:
         except Exception as e:
             status["services"]["qdrant"] = {"status": "unhealthy", "error": str(e)}
 
-        # 4. OpenRouter (API Key check only, no real completion to save costs)
+        # 4. LLM Router (Check default provider health)
         try:
             start_t = time.time()
-            llm = get_llm_client()
-            if llm:
-                status["services"]["openrouter"] = {
+            settings = get_settings()
+            provider = get_provider_instance(settings.LLM_PROVIDER, getattr(settings, f"{settings.LLM_PROVIDER.upper()}_MODEL", "default"))
+            if provider.health_check():
+                status["services"]["llm_provider"] = {
                     "status": "healthy",
-                    "latency_ms": round((time.time() - start_t) * 1000, 2)
+                    "latency_ms": round((time.time() - start_t) * 1000, 2),
+                    "provider": settings.LLM_PROVIDER
                 }
             else:
-                status["services"]["openrouter"] = {"status": "unhealthy", "error": "Client not initialized"}
+                status["services"]["llm_provider"] = {"status": "unhealthy", "error": "Health check failed"}
         except Exception as e:
-            status["services"]["openrouter"] = {"status": "unhealthy", "error": str(e)}
+            status["services"]["llm_provider"] = {"status": "unhealthy", "error": str(e)}
 
         self._status_cache = status
         self._last_check_time = status["timestamp"]

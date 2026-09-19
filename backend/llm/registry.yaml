@@ -1,0 +1,41 @@
+entity_extraction:
+  preferred:
+    - provider: ollama
+      model: qwen2.5-coder:3b
+    - provider: ollama
+      model: qwen2.5:3b
+  fallback:
+    - provider: openrouter
+      model: openrouter/free
+    - provider: anthropic
+      model: claude-3-5-haiku-latest
+    - provider: openai
+      model: gpt-4o-mini
+
+summary:
+  preferred:
+    - provider: ollama
+      model: qwen2.5:3b
+    - provider: ollama
+      model: llama3.2:3b
+  fallback:
+    - provider: openrouter
+      model: openrouter/free
+
+complex_reasoning:
+  preferred:
+    - provider: openrouter
+      model: openrouter/free
+  fallback:
+    - provider: anthropic
+      model: claude-3-7-sonnet-latest
+    - provider: openai
+      model: gpt-4o
+
+embedding:
+  preferred:
+    - provider: local
+      model: sentence-transformers/all-MiniLM-L6-v2
+  fallback:
+    - provider: local
+      model: nomic-embed-text

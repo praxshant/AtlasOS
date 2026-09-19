@@ -25,10 +25,19 @@ class Settings(BaseSettings):
     # Job Queue Redis
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # Large Language Models
+    # Large Language Models & AI Gateway
+    LLM_PROVIDER: str = "ollama"
+    ENABLE_CLOUD_FALLBACK: bool = False
+    OLLAMA_ENABLED: bool = True
+    OLLAMA_URL: str = "http://localhost:11434"
+    
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_MODEL: str = "openrouter/free"
-    LLM_PROVIDER: str = "openrouter"
+    ANTHROPIC_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
+    GEMINI_API_KEY: str = ""
+    GROQ_API_KEY: str = ""
+    ASSET_ENTITY_TYPES: list[str] = ["Equipment", "Asset", "Hardware", "System", "Software", "Subsystem"]
     
     # GraphRAG Settings
     NEO4J_MAX_DEPTH: int = 3
@@ -60,7 +69,11 @@ class Settings(BaseSettings):
     ALLOWED_UPLOAD_EXTENSIONS: list[str] = [".pdf", ".docx", ".txt", ".log", ".csv", ".json", ".xlsx", ".xls", ".pptx", ".ppt"]
     
     # Embeddings
-    EMBEDDING_MODEL_NAME: str = "BAAI/bge-large-en-v1.5"
+    EMBEDDING_PROVIDER: str = "local"
+    # all-MiniLM-L6-v2: 384-dim, <100MB, 10-20x faster than bge-m3 on CPU.
+    # bge-m3 (1024-dim) is excellent quality but requires a GPU for local use.
+    EMBEDDING_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
+    EMBEDDING_MODEL_FALLBACK: str = "nomic-embed-text"
 
     # File uploads
     UPLOAD_DIR: str = "uploads"
@@ -71,11 +84,17 @@ class Settings(BaseSettings):
     CELERY_POOL: str = "threads"        # threads | prefork | gevent | solo
     CELERY_CONCURRENCY: int = 4
 
-    # LLM Provider Abstraction
-    OLLAMA_ENABLED: bool = False
-    OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "mistral"
-    DISABLE_LLM_EXTRACTION: bool = False  # skip LLM when quota exhausted
+    # AI Execution Planner & Routing
+    OLLAMA_ENABLED: bool = True
+    OLLAMA_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "qwen2.5:3b"
+    ENABLE_SEMANTIC_CACHE: bool = True
+    ENABLE_FALLBACK: bool = True
+    ENABLE_LOCAL_FIRST: bool = True
+    CONFIDENCE_THRESHOLD: float = 0.92
+    MAX_RETRIES: int = 3
+    REQUEST_TIMEOUT: int = 60
+    DISABLE_LLM_EXTRACTION: bool = False
 
     # Batch sizes
     EMBED_BATCH_SIZE: int = 64

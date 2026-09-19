@@ -5,7 +5,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Tuple
 from sqlalchemy.orm import Session
 from backend.db.postgres import Entity
-from backend.utils.llm_client import structured_complete
+from backend.llm.planner import planner
+from backend.knowledge_engineering.ontology.relationships import VALID_RELATIONSHIPS, normalize_relationship
 
 logger = logging.getLogger(__name__)
 
@@ -19,55 +20,7 @@ VALID_LABELS = {
     "MissingCategory",
 }
 
-# ─────────────────────────────────────────────────────────────────────────────
-# VALID RELATIONSHIP TYPES
-# ─────────────────────────────────────────────────────────────────────────────
-VALID_RELATIONSHIPS = {
-    # Core operational
-    "OCCURRED_ON", "MAINTAINED_BY", "REPORTED_BY", "CAUSED_BY",
-    "PREVENTS", "VIOLATES", "COMPLIES_WITH", "RELATED_TO",
-    "RESULTED_IN", "APPLIES_TO", "LEARNED_FROM",
-    # Graph ontology (Engineering Bible standard)
-    "FOLLOWS",          # Asset follows a Procedure
-    "GOVERNED_BY",      # Asset governed by Regulation
-    "AFFECTED_BY",      # Asset affected by an Incident
-    "DOCUMENTED_IN",    # Entity documented in a Document/Procedure
-    "AUTHORED_BY",      # Procedure or document authored by a Person
-    "INSPECTED_BY",     # Asset inspected by a Person
-    "INVOLVED_IN",      # Person/Asset involved in an Incident
-    "HAS_PROCEDURE",    # Asset has a Procedure
-    "OPERATED_BY",      # Asset operated by a Person
-    "PERFORMED_ON",     # WorkOrder performed on Asset
-    "RESPONSE_TO",      # WorkOrder is response to Incident
-    "FEEDS",            # Equipment feeds Equipment
-    "SUPPLIES",         # Equipment supplies Equipment
-    "BELONGS_TO",       # Component belongs to Asset
-    "REFERENCES",       # Document references Procedure/Asset
-    "KNOWLEDGE_OWNER",  # Person is knowledge owner of Asset
-    "HAS_KNOWLEDGE_GAP", # Entity has knowledge gap
-    "DOCUMENTED_BY",    # Asset documented by Document
-}
 
-# Mapping for invalid relationship types → nearest valid type
-RELATIONSHIP_TYPE_MAP = {
-    "AFFECTS":                "AFFECTED_BY",
-    "AFFECT":                 "AFFECTED_BY",
-    "REQUIRES_INPUT_FROM":    "RELATED_TO",
-    "ASSOCIATED_WITH":        "RELATED_TO",
-    "CONNECTED_TO":           "RELATED_TO",
-    "LINKED_TO":              "RELATED_TO",
-    "PART_OF":                "BELONGS_TO",
-    "OWNED_BY":               "KNOWLEDGE_OWNER",
-    "DOCUMENTED_BY_PERSON":   "AUTHORED_BY",
-    "WRITTEN_BY":             "AUTHORED_BY",
-    "DESCRIBES":              "DOCUMENTED_IN",
-    "COVERS":                 "DOCUMENTED_IN",
-    "IMPACTS":                "AFFECTED_BY",
-    "USES":                   "FOLLOWS",
-    "APPLIED_TO":             "APPLIES_TO",
-    "WORKS_ON":               "PERFORMED_ON",
-    "SUBMITTED_BY":           "REPORTED_BY",
-}
 
 # Equipment tag regex: P-101, R201, C-17, B-12, HX-34, V-301, etc.
 EQUIPMENT_TAG_PATTERN = re.compile(
@@ -88,46 +41,7 @@ PERSON_ROLE_PATTERNS = re.compile(
 )
 
 
-def canonicalize_entity_name(name: str) -> str:
-    """
-    Normalises entity names so that C17, C-17, Compressor C17 all resolve
-    to a single canonical ID.
-
-    Rules applied in order:
-    1. Strip leading/trailing whitespace
-    2. Inject hyphen between letter prefix and number suffix:
-       P101 → P-101, C17 → C-17, R201 → R-201
-    3. Map known prefixes to their canonical descriptions (e.g. Compressor C-17)
-    4. Collapse multiple spaces.
-    """
-    name = name.strip()
-    # Inject hyphen between letter prefix and numeric suffix
-    name = re.sub(r'\b([A-Z]{1,4})(\d{1,4})\b', r'\1-\2', name)
-    
-    # Prefix mapping dictionary for tag canonicalization
-    prefix_map = {
-        "C": "Compressor",
-        "P": "Pump",
-        "R": "Reactor",
-        "B": "Boiler",
-        "HX": "Heat Exchanger",
-        "CT": "Cooling Tower",
-        "V": "Vessel"
-    }
-    
-    # Check for tags like C-17, P-101, R-201, B-12, HX-34, CT-05, V-301
-    tag_match = re.search(r'\b(C|P|R|B|HX|CT|V)-?(\d+)\b', name, re.IGNORECASE)
-    if tag_match:
-        prefix = tag_match.group(1).upper()
-        num = tag_match.group(2)
-        tag = f"{prefix}-{num}"
-        if prefix in prefix_map:
-            name = f"{prefix_map[prefix]} {tag}"
-
-    # Collapse whitespace
-    name = re.sub(r'\s+', ' ', name)
-    return name
-
+# Canonicalization has been moved to the knowledge_engineering pipeline
 
 def regex_extract_industrial_entities(text: str) -> List[dict]:
     """
@@ -208,7 +122,7 @@ def _levenshtein(s1: str, s2: str) -> int:
 def merge_and_canonicalize(regex_entities: List[dict], llm_entities: List[dict]) -> List[dict]:
     # Normalize llm entities
     for e in llm_entities:
-        e["name"] = canonicalize_entity_name(e["name"])
+        e["name"] = e["name"].strip()
         e["aliases"] = e.get("aliases", [e["name"]])
         e["source"] = "llm"
         e["confidence"] = e.get("confidence", 0.5)
@@ -252,7 +166,7 @@ def merge_and_canonicalize(regex_entities: List[dict], llm_entities: List[dict])
     seen = set()
     final_merged = []
     for m in merged:
-        cname = canonicalize_entity_name(m["name"])
+        cname = m["name"].strip()
         m["name"] = cname
         if cname not in seen:
             seen.add(cname)
@@ -322,8 +236,8 @@ def extract_relationships_hybrid(text: str, entities: List[dict], llm_rels: List
     
     merged = {}
     for r in all_rels:
-        s = canonicalize_entity_name(r["source"])
-        t = canonicalize_entity_name(r["target"])
+        s = r["source"].strip()
+        t = r["target"].strip()
         r_type = remap_relationship_type(r["type"])
         key = (s, t, r_type)
         if key not in merged:
@@ -384,10 +298,8 @@ def score_relationship_confidence(relationships: List[dict]) -> List[dict]:
 
 
 def remap_relationship_type(rel_type: str) -> str:
-    """Maps invalid/unusual relationship types to the nearest valid type."""
-    if rel_type in VALID_RELATIONSHIPS:
-        return rel_type
-    return RELATIONSHIP_TYPE_MAP.get(rel_type, "RELATED_TO")
+    """Maps relationship types strictly via the V2 ontology."""
+    return normalize_relationship(rel_type)
 
 
 def build_extraction_prompt(chunk_text: str) -> str:
@@ -423,10 +335,14 @@ ENTITY EXTRACTION RULES:
 
 RELATIONSHIP EXTRACTION RULES:
 Extract all direct relationships. Each must have:
-- source, target, type (EXACTLY one of: {sorted(list(VALID_RELATIONSHIPS))}), confidence 0.0-1.0
+- source, target, type, confidence 0.0-1.0
 
-Use specific types: CAUSED_BY, RESULTED_IN, PERFORMED_ON, AUTHORED_BY, AFFECTED_BY,
-FOLLOWS, GOVERNED_BY, DOCUMENTED_IN, HAS_PROCEDURE, OPERATED_BY, INSPECTED_BY.
+CRITICAL ONTOLOGY CONSTRAINT:
+The relationship `type` MUST be EXACTLY ONE of the following allowed values:
+{sorted(list(VALID_RELATIONSHIPS))}
+
+Do not invent new relationship types (e.g. do not use "WORKS_WITH", use "CONNECTED_TO" or "PART_OF").
+If you cannot confidently map a relationship to the strict ontology above, you MUST use the exact string "RELATED_TO".
 
 Return ONLY valid JSON (no markdown, no extra text):
 {{
@@ -461,7 +377,22 @@ def extract_entities_and_relationships(chunk_text: str) -> Tuple[List[Dict[str, 
     )
 
     try:
-        data = structured_complete(prompt, system_prompt=system_prompt, max_tokens=3000)
+        # 1st Pass: Local or preferred provider via planner
+        data = planner.structured(task="entity_extraction", prompt=prompt, system_prompt=system_prompt, max_tokens=3000)
+        
+        # Confidence Escalation
+        from backend.config import get_settings
+        settings = get_settings()
+        
+        # Calculate average confidence if any entities were returned
+        entities_list = data.get("entities", [])
+        avg_confidence = sum(e.get("confidence", 0.5) for e in entities_list) / len(entities_list) if entities_list else 1.0
+        
+        if avg_confidence < settings.CONFIDENCE_THRESHOLD and settings.ENABLE_FALLBACK:
+            logger.info(f"Low confidence ({avg_confidence:.2f} < {settings.CONFIDENCE_THRESHOLD}). Escalating to complex_reasoning task.")
+            # Re-run with complex reasoning task (which routes to cloud)
+            data = planner.structured(task="complex_reasoning", prompt=prompt, system_prompt=system_prompt, max_tokens=3000, use_cache=False)
+            
         llm_entities = data.get("entities", [])
         llm_relationships = data.get("relationships", [])
     except Exception as e:
@@ -497,7 +428,7 @@ def deduplicate_and_save_entities(db: Session, entities: List[Dict[str, Any]], d
     entity_mapping = {}
 
     for entity_data in entities:
-        name = canonicalize_entity_name(entity_data["name"].strip())
+        name = entity_data["name"].strip()
         etype = entity_data.get("type", "Equipment")
         if etype not in VALID_LABELS:
             etype = "Equipment"
@@ -623,7 +554,7 @@ def _parse_batch_response(data: dict, batch: list[dict]) -> dict[int, Extraction
             etype = e.get("type")
             if etype not in VALID_LABELS:
                 continue
-            e["name"] = canonicalize_entity_name(e.get("name", ""))
+            e["name"] = e.get("name", "").strip()
             e.setdefault("extraction_method", "llm")
             ents.append(e)
         rels = [
@@ -631,18 +562,18 @@ def _parse_batch_response(data: dict, batch: list[dict]) -> dict[int, Extraction
             if r.get("type") in VALID_RELATIONSHIPS
         ]
         for r in rels:
-            r["source"] = canonicalize_entity_name(r.get("source", ""))
-            r["target"] = canonicalize_entity_name(r.get("target", ""))
+            r["source"] = r.get("source", "").strip()
+            r["target"] = r.get("target", "").strip()
         out[cid] = ExtractionResult(entities=ents, relationships=rels)
     return out
 
 async def _call_llm(prompt: str) -> dict:
-    from backend.utils.llm_client import structured_complete
     return await asyncio.to_thread(
-        structured_complete,
-        prompt,
-        "You are a senior process safety analyst. Return strict JSON only.",
-        3000
+        planner.structured,
+        task="entity_extraction",
+        prompt=prompt,
+        system_prompt="You are a senior process safety analyst. Return strict JSON only.",
+        max_tokens=3000
     )
 
 async def extract_entities_batched(chunks: list[str]) -> list[ExtractionResult]:
@@ -730,11 +661,17 @@ TEXT:
 {full_document_text}
 """
             sys_prompt = "You are an expert Industrial Knowledge Graph extractor. Only output valid JSON matching the schema."
-            from backend.utils.llm_provider import get_provider
-            
             try:
-                provider = get_provider()
-                res = provider.structured_complete(prompt, system_prompt=sys_prompt, max_tokens=2500)
+                res = planner.structured(task="entity_extraction", prompt=prompt, system_prompt=sys_prompt, max_tokens=2500)
+                
+                # Confidence Escalation
+                entities_list = res.get("entities", []) if isinstance(res, dict) else []
+                avg_confidence = sum(e.get("confidence", 0.5) for e in entities_list) / len(entities_list) if entities_list else 1.0
+                
+                if avg_confidence < settings.CONFIDENCE_THRESHOLD and settings.ENABLE_FALLBACK:
+                    logger.info(f"One-call extraction low confidence ({avg_confidence:.2f}). Escalating to cloud.")
+                    res = planner.structured(task="complex_reasoning", prompt=prompt, system_prompt=sys_prompt, max_tokens=2500, use_cache=False)
+                
                 if isinstance(res, dict) and "entities" in res:
                     llm_entities = res.get("entities", [])
                     llm_rels = res.get("relationships", [])
@@ -749,7 +686,7 @@ TEXT:
         final_entities = []
         seen_entities = set()
         for e in all_entities:
-            c_name = canonicalize_entity_name(e.get("name", ""))
+            c_name = e.get("name", "").strip()
             if not c_name: continue
             if c_name not in seen_entities:
                 seen_entities.add(c_name)
@@ -768,13 +705,13 @@ TEXT:
                 
         final_rels = []
         for r in all_rels:
-            src = canonicalize_entity_name(r.get("source", ""))
-            tgt = canonicalize_entity_name(r.get("target", ""))
+            src = r.get("source", "").strip()
+            tgt = r.get("target", "").strip()
             if not src or not tgt: continue
             
             rel_type = r.get("type", "RELATED_TO").upper().replace(" ", "_")
             if rel_type not in VALID_RELATIONSHIPS:
-                rel_type = RELATIONSHIP_TYPE_MAP.get(rel_type, "RELATED_TO")
+                rel_type = remap_relationship_type(rel_type)
                 
             final_rels.append({
                 "source": src,
@@ -785,7 +722,23 @@ TEXT:
                 "document_id": doc_id
             })
             
-        final_result = {"entities": final_entities, "relationships": final_rels}
+        # ── V2.6 Explainability: reasoning trace ──────────────────────────────
+        validated_rel_count = len(final_rels)
+        rejected_rel_count = len([r for r in all_rels if r.get("type", "") not in VALID_RELATIONSHIPS])
+        
+        final_result = {
+            "entities": final_entities,
+            "relationships": final_rels,
+            "reasoning_trace": {
+                "regex_entities_found": len(regex_entities),
+                "llm_entities_found": len(llm_entities),
+                "total_entities_after_merge": len(final_entities),
+                "total_relationships_validated": validated_rel_count,
+                "relationships_rejected_by_ontology": rejected_rel_count,
+                "extraction_method": "regex+llm" if (regex_entities and llm_entities) else ("regex" if regex_entities else "llm"),
+            }
+        }
+        # ──────────────────────────────────────────────────────────────────────
         
         # 5. Save to Cache
         if not settings.DISABLE_LLM_EXTRACTION: # Only cache if LLM actually ran

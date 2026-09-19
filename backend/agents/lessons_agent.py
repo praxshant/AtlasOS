@@ -1,11 +1,10 @@
-import json
 import logging
 from typing import TypedDict, List, Dict, Any
 from langgraph.graph import StateGraph, END
 
 from backend.vector.qdrant_client import qdrant_client
 from backend.graph.neo4j_client import neo4j_client
-from backend.utils.llm_client import structured_complete
+from backend.llm.planner import planner
 
 logger = logging.getLogger(__name__)
 
@@ -116,7 +115,9 @@ def pattern_mining_node(state: LessonsState) -> Dict[str, Any]:
     Return the response strictly as JSON. No markdown wrappers or extra conversational text.
     """
     try:
-        report_data = structured_complete(prompt)
+        report_data = planner.structured(task="summary", prompt=prompt)
+        
+        # Merge citations {"report": report_data}
         return {"report": report_data}
     except Exception as e:
         logger.error(f"Failed to mine lessons patterns: {e}")

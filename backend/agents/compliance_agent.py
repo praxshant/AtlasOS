@@ -5,7 +5,7 @@ from langgraph.graph import StateGraph, END
 
 from backend.db.postgres import SessionLocal, Document, Chunk, Entity
 from backend.graph.neo4j_client import neo4j_client
-from backend.utils.llm_client import structured_complete
+from backend.llm.planner import planner
 import re
 
 logger = logging.getLogger(__name__)
@@ -204,7 +204,21 @@ def evaluate_compliance_node(state: ComplianceState) -> Dict[str, Any]:
     Return the response strictly as JSON. No markdown wrappers.
     """
     try:
-        report_data = structured_complete(prompt)
+        report_data = planner.structured(task="compliance_audit", prompt=prompt)
+        
+        # Guard: detect degenerate/vacuous evaluation where no requirements were checked
+        evaluations = report_data.get("evaluations", [])
+        compliant_count = report_data.get("compliant_count", 0)
+        gap_count = report_data.get("gap_count", 0)
+
+        if not evaluations and compliant_count == 0 and gap_count == 0:
+            report_data["overall_risk"] = "Unknown"
+            report_data["status"] = "INCOMPLETE"
+            report_data["status_reason"] = "No applicable regulations or requirements could be evaluated for this document."
+        else:
+            report_data["status"] = "PASS" if gap_count == 0 else "FAIL"
+
+        # Structure the final report_data
         return {"report": report_data}
     except Exception as e:
         logger.error(f"Failed to generate compliance report: {e}")
