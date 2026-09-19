@@ -8,7 +8,11 @@ from sqlalchemy import text
 sys.path.append(r"c:\Users\ACER\OneDrive\Desktop\AtlasOS")
 
 from backend.db.postgres import SessionLocal, Document, ProcessingJob, Chunk, Entity, Tenant, init_db
-from backend.tasks.ingestion_tasks import process_document_task
+from backend.tasks.ingestion_tasks import (
+    validate_task, parse_and_chunk_task, embed_task, extract_entities_task, 
+    extract_relationships_task, graph_upsert_task, quality_validation_task, precompute_analytics_task
+)
+from celery import chain
 from backend.tasks.progress_tracker import progress_tracker
 from backend.vector.qdrant_client import qdrant_client
 from backend.graph.neo4j_client import neo4j_client
@@ -67,8 +71,18 @@ def run_test():
     
     # 3. Dispatch Celery task
     print("Dispatching Celery task...")
-    result = process_document_task.delay(job_id, tenant_id)
-    print(f"Task dispatched with celery ID: {result.id}")
+    workflow = chain(
+        validate_task.s(job_id, tenant_id),
+        parse_and_chunk_task.s(),
+        embed_task.s(),
+        extract_entities_task.s(),
+        extract_relationships_task.s(),
+        graph_upsert_task.s(),
+        quality_validation_task.s(),
+        precompute_analytics_task.s()
+    )
+    result = workflow.apply_async()
+    print(f"Task DAG dispatched with celery group ID: {result.id}")
     
     # 4. Wait for processing (polling Redis & Postgres)
     print("Waiting for task to complete...")

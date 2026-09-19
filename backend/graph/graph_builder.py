@@ -2,7 +2,7 @@ import re
 import logging
 from typing import List, Dict, Any
 from backend.graph.neo4j_client import neo4j_client
-from backend.ingestion.entity_extractor import canonicalize_entity_name, remap_relationship_type, VALID_RELATIONSHIPS
+from backend.ingestion.entity_extractor import remap_relationship_type
 
 logger = logging.getLogger(__name__)
 
@@ -12,18 +12,22 @@ def clean_property_key(key: str) -> str:
     return re.sub(r'[^a-zA-Z0-9_]', '_', key).strip("_")
 
 
-def _make_canonical_id(name: str) -> str:
-    """Creates a stable canonical ID from a name for deduplication."""
-    return re.sub(r'[^A-Z0-9]', '', name.upper())
+def _make_canonical_id(name: str, tenant_id: str = "default") -> str:
+    """Creates a stable canonical ID from a name and tenant for deduplication."""
+    normalized = name.strip().upper().replace(" ", "_")
+    normalized = re.sub(r'[^A-Z0-9_]', '', normalized)
+    return f"{tenant_id}:{normalized}"
 
 
 def upsert_entity(entity: Dict[str, Any], doc_id: int, tenant_id: str = "default") -> bool:
     """Inserts or updates an entity node in Neo4j, scoped to a tenant."""
-    name = canonicalize_entity_name(entity["name"].strip())
+    name = entity.get("canonical_name", entity["name"].strip())
     label = entity["type"]
     confidence = entity.get("confidence", 1.0)
     properties = entity.get("properties", {})
-    canonical_id = _make_canonical_id(name)
+    
+    # Use canonical_id provided by resolution pipeline if available
+    canonical_id = entity.get("canonical_id", _make_canonical_id(name, tenant_id))
     aliases = entity.get("aliases", [name])
     extraction_method = entity.get("source", "llm")
     
@@ -44,25 +48,32 @@ def upsert_entity(entity: Dict[str, Any], doc_id: int, tenant_id: str = "default
         logger.error(f"Invalid entity label name: {label}")
         return False
 
-    # MERGE on canonical_id to prevent C17/C-17 duplicates
+    # MERGE on canonical_id and tenant_id to prevent duplicate nodes.
+    # We omit the Neo4j label from the MERGE clause. If the label were included and an LLM extracted
+    # the same entity with a different label later, Neo4j would create a duplicate node.
+    # Duplicate nodes cause a Cartesian product explosion when creating relationships.
     cypher = f"""
-    MERGE (n:{label} {{canonical_id: $canonical_id, tenant_id: $tenant_id}})
+    MERGE (n {{canonical_id: $canonical_id, tenant_id: $tenant_id}})
     ON CREATE SET n.name = $name,
+                  n.entity_type = $entity_type,
                   n.aliases = $aliases,
                   n.confidence = $confidence,
                   n.source_doc_id = $source_doc_id,
                   n.extraction_method = $extraction_method,
                   n.created_at = timestamp()
     ON MATCH SET n.aliases = [x IN n.aliases + $aliases WHERE x IS NOT NULL],
-                 n.confidence = case when $confidence > n.confidence then $confidence else n.confidence end,
+                 n.confidence = CASE WHEN $confidence > n.confidence THEN $confidence ELSE n.confidence END,
                  n.name = CASE WHEN $confidence > n.confidence THEN $name ELSE n.name END,
+                 n.entity_type = $entity_type,
                  n.last_updated = timestamp()
+    SET n:`{label}`
     """
 
     params = {
         "name": name,
         "canonical_id": canonical_id,
         "tenant_id": tenant_id,
+        "entity_type": label,
         "source_doc_id": doc_id,
         "confidence": confidence,
         "aliases": aliases,
@@ -110,58 +121,55 @@ def upsert_entity(entity: Dict[str, Any], doc_id: int, tenant_id: str = "default
 
 
 def upsert_relationship(rel: Dict[str, Any], doc_id: int, tenant_id: str = "default") -> bool:
-    """Inserts or updates a relationship edge in Neo4j, scoped to a tenant."""
-    source = canonicalize_entity_name(rel["source"].strip())
-    target = canonicalize_entity_name(rel["target"].strip())
+    """
+    Inserts or updates a relationship in Neo4j, scoped to a tenant.
+    Matches nodes strictly by canonical_id to prevent duplicates.
+    """
+    source_name = rel.get("source_canonical_name", rel.get("source", "").strip())
+    target_name = rel.get("target_canonical_name", rel.get("target", "").strip())
+    
+    source_cid = rel.get("source_cid", _make_canonical_id(source_name, tenant_id))
+    target_cid = rel.get("target_cid", _make_canonical_id(target_name, tenant_id))
+    
     rel_type = remap_relationship_type(rel.get("type", "RELATED_TO"))
     confidence = rel.get("confidence", 1.0)
     extraction_method = rel.get("extraction_method", "llm")
 
     if confidence < 0.40:
-        logger.info(f"Skipping relationship {source} -> {target} due to low confidence ({confidence})")
+        logger.info(f"Skipping relationship {source_cid} -> {target_cid} due to low confidence ({confidence})")
         return False
 
     if not re.match(r'^[a-zA-Z0-9_]+$', rel_type):
         logger.error(f"Invalid relationship type after remapping: {rel_type}")
         return False
 
-    source_cid = _make_canonical_id(source)
-    target_cid = _make_canonical_id(target)
-
-    # WHERE clause matches by aliases too, not just canonical_name
+    # MATCH by unique canonical_id
     cypher = f"""
-    MATCH (s {{tenant_id: $tenant_id}})
-    WHERE s.canonical_id = $source_cid OR $source IN s.aliases OR s.short_id = $source_cid
-    WITH s
-    MATCH (t {{tenant_id: $tenant_id}})
-    WHERE t.canonical_id = $target_cid OR $target IN t.aliases OR t.short_id = $target_cid
-    WITH s, t
+    MATCH (s {{tenant_id: $tenant_id, canonical_id: $source_cid}})
+    MATCH (t {{tenant_id: $tenant_id, canonical_id: $target_cid}})
     WHERE id(s) <> id(t)
-    MERGE (s)-[r:{rel_type}]->(t)
+    MERGE (s)-[r:{rel_type} {{tenant_id: $tenant_id}}]->(t)
     ON CREATE SET r.source_doc_id = $source_doc_id,
                   r.confidence = $confidence,
                   r.extraction_method = $extraction_method,
-                  r.tenant_id = $tenant_id,
                   r.created_at = timestamp(),
                   r.chunk_id = $chunk_id,
                   r.evidence = $evidence,
                   r.event_time = $event_time,
                   r.valid_from = $valid_from,
                   r.valid_to = $valid_to
-    ON MATCH SET r.confidence = case when $confidence > r.confidence then $confidence else r.confidence end,
+    ON MATCH SET r.confidence = CASE WHEN $confidence > r.confidence THEN $confidence ELSE r.confidence END,
                  r.last_updated = timestamp(),
                  r.event_time = coalesce($event_time, r.event_time),
                  r.valid_from = coalesce($valid_from, r.valid_from),
                  r.valid_to = coalesce($valid_to, r.valid_to),
-                 r.evidence = case when $evidence IS NOT NULL AND r.evidence IS NULL then $evidence 
-                                   when $evidence IS NOT NULL AND size($evidence) > size(coalesce(r.evidence, "")) then $evidence 
-                                   else r.evidence end
+                 r.evidence = CASE WHEN $evidence IS NOT NULL AND r.evidence IS NULL THEN $evidence 
+                                   WHEN $evidence IS NOT NULL AND size($evidence) > size(coalesce(r.evidence, "")) THEN $evidence 
+                                   ELSE r.evidence END
     RETURN type(r)
     """
 
     params = {
-        "source": source,
-        "target": target,
         "source_cid": source_cid,
         "target_cid": target_cid,
         "tenant_id": tenant_id,
@@ -178,11 +186,11 @@ def upsert_relationship(rel: Dict[str, Any], doc_id: int, tenant_id: str = "defa
     try:
         results = neo4j_client.run_query(cypher, params)
         if not results:
-            logger.warning(f"Could not create relationship {source} -> {target} (nodes may not exist yet)")
+            logger.warning(f"Could not create relationship {source_cid} -> {target_cid} (nodes may not exist yet)")
             return False
         return True
     except Exception as e:
-        logger.error(f"Failed to upsert Neo4j relationship {source} -[{rel_type}]-> {target}: {e}")
+        logger.error(f"Failed to upsert Neo4j relationship {source_cid} -[{rel_type}]-> {target_cid}: {e}")
         return False
 
 
@@ -197,7 +205,7 @@ def batch_upsert_entities(entities: List[Dict[str, Any]], doc_id: int, tenant_id
     seen_canonical = {}
     deduplicated = []
     for entity in entities:
-        key = entity["name"].lower().strip()
+        key = entity.get("canonical_id", _make_canonical_id(entity["name"].strip(), tenant_id))
         if key not in seen_canonical:
             seen_canonical[key] = entity
             deduplicated.append(entity)
@@ -215,7 +223,7 @@ def batch_upsert_entities(entities: List[Dict[str, Any]], doc_id: int, tenant_id
         if label not in label_groups:
             label_groups[label] = []
 
-        name = canonicalize_entity_name(entity["name"].strip())
+        name = entity.get("canonical_name", entity["name"].strip())
         
         asset_id = None
         if label == "Equipment":
@@ -225,8 +233,7 @@ def batch_upsert_entities(entities: List[Dict[str, Any]], doc_id: int, tenant_id
                 
         label_groups[label].append({
             "name": name,
-            "canonical_id": _make_canonical_id(name),
-            "short_id": _make_canonical_id(entity["name"].strip()),
+            "canonical_id": entity.get("canonical_id", _make_canonical_id(name, tenant_id)),
             "confidence": entity.get("confidence", 1.0),
             "source_doc_id": doc_id,
             "aliases": entity.get("aliases", [name]),
@@ -240,9 +247,9 @@ def batch_upsert_entities(entities: List[Dict[str, Any]], doc_id: int, tenant_id
     for label, entity_batch in label_groups.items():
         cypher = f"""
         UNWIND $entities AS entity
-        MERGE (n:{label} {{canonical_id: entity.canonical_id, tenant_id: $tenant_id}})
+        MERGE (n {{canonical_id: entity.canonical_id, tenant_id: $tenant_id}})
         ON CREATE SET n.name = entity.name,
-                      n.short_id = entity.short_id,
+                      n.entity_type = $entity_type,
                       n.source_doc_id = entity.source_doc_id,
                       n.confidence = entity.confidence,
                       n.aliases = entity.aliases,
@@ -250,21 +257,22 @@ def batch_upsert_entities(entities: List[Dict[str, Any]], doc_id: int, tenant_id
                       n.created_at = timestamp()
         ON MATCH SET n.confidence = CASE WHEN entity.confidence > n.confidence THEN entity.confidence ELSE n.confidence END,
                      n.name = CASE WHEN entity.confidence > n.confidence THEN entity.name ELSE n.name END,
-                     n.short_id = entity.short_id,
+                     n.entity_type = $entity_type,
                      n.aliases = [x IN n.aliases + entity.aliases WHERE x IS NOT NULL],
                      n.last_updated = timestamp()
+        SET n:`{label}`
         SET n += entity.properties
         WITH n, entity
         WHERE entity.asset_id IS NOT NULL
         SET n.asset_id = entity.asset_id
         """
         try:
-            neo4j_client.run_query(cypher, {"entities": entity_batch, "tenant_id": tenant_id})
+            neo4j_client.run_query(cypher, {"entities": entity_batch, "tenant_id": tenant_id, "entity_type": label})
             total_created += len(entity_batch)
         except Exception as e:
             logger.warning(f"Batch upsert failed for label {label}, falling back to individual: {e}")
             for entity_data in entity_batch:
-                orig = {"name": entity_data["name"], "type": label, "confidence": entity_data["confidence"],
+                orig = {"name": entity_data["name"], "canonical_id": entity_data["canonical_id"], "type": label, "confidence": entity_data["confidence"],
                         "properties": entity_data["properties"], "aliases": entity_data["aliases"], "source": entity_data["extraction_method"]}
                 if upsert_entity(orig, doc_id, tenant_id):
                     total_created += 1
@@ -293,13 +301,13 @@ def batch_upsert_relationships(relationships: List[Dict[str, Any]], doc_id: int,
             
         if rel_type not in type_groups:
             type_groups[rel_type] = []
-        source = canonicalize_entity_name(rel["source"].strip())
-        target = canonicalize_entity_name(rel["target"].strip())
+        
+        source_name = rel.get("source_canonical_name", rel.get("source", "").strip())
+        target_name = rel.get("target_canonical_name", rel.get("target", "").strip())
+        
         type_groups[rel_type].append({
-            "source": source,
-            "target": target,
-            "source_cid": _make_canonical_id(source),
-            "target_cid": _make_canonical_id(target),
+            "source_cid": rel.get("source_cid", _make_canonical_id(source_name, tenant_id)),
+            "target_cid": rel.get("target_cid", _make_canonical_id(target_name, tenant_id)),
             "confidence": confidence,
             "extraction_method": rel.get("extraction_method", "llm"),
             "chunk_id": rel.get("chunk_index"),
@@ -313,26 +321,13 @@ def batch_upsert_relationships(relationships: List[Dict[str, Any]], doc_id: int,
     for rel_type, rel_batch in type_groups.items():
         cypher = f"""
         UNWIND $rels AS rel
-        MATCH (s {{tenant_id: $tenant_id}})
-        WHERE s.canonical_id = rel.source_cid
-           OR rel.source IN s.aliases
-           OR s.short_id = rel.source_cid
-           OR s.canonical_id ENDS WITH rel.source_cid
-           OR rel.source_cid ENDS WITH s.canonical_id
-        WITH s, rel
-        MATCH (t {{tenant_id: $tenant_id}})
-        WHERE t.canonical_id = rel.target_cid
-           OR rel.target IN t.aliases
-           OR t.short_id = rel.target_cid
-           OR t.canonical_id ENDS WITH rel.target_cid
-           OR rel.target_cid ENDS WITH t.canonical_id
-        WITH s, t, rel
+        MATCH (s {{tenant_id: $tenant_id, canonical_id: rel.source_cid}})
+        MATCH (t {{tenant_id: $tenant_id, canonical_id: rel.target_cid}})
         WHERE id(s) <> id(t)
-        MERGE (s)-[r:{rel_type}]->(t)
+        MERGE (s)-[r:{rel_type} {{tenant_id: $tenant_id}}]->(t)
         ON CREATE SET r.source_doc_id = $source_doc_id,
                       r.confidence = rel.confidence,
                       r.extraction_method = rel.extraction_method,
-                      r.tenant_id = $tenant_id,
                       r.created_at = timestamp(),
                       r.chunk_id = rel.chunk_id,
                       r.evidence = rel.evidence,
@@ -360,7 +355,7 @@ def batch_upsert_relationships(relationships: List[Dict[str, Any]], doc_id: int,
         except Exception as e:
             logger.warning(f"Batch upsert failed for rel type {rel_type}, falling back: {e}")
             for rel_data in rel_batch:
-                orig = {"source": rel_data["source"], "target": rel_data["target"],
+                orig = {"source_cid": rel_data["source_cid"], "target_cid": rel_data["target_cid"],
                         "type": rel_type, "confidence": rel_data["confidence"], "extraction_method": rel_data["extraction_method"],
                         "chunk_index": rel_data["chunk_id"], "evidence": rel_data["evidence"],
                         "event_time": rel_data.get("event_time"), "valid_from": rel_data.get("valid_from"), "valid_to": rel_data.get("valid_to")}

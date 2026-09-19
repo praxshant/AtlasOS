@@ -45,7 +45,7 @@ from backend.utils.auth import (
 from backend.tasks.progress_tracker import progress_tracker
 
 # Import logging configuration
-from backend.utils.logging_config import setup_logging, set_correlation_id, get_correlation_id
+from backend.utils.logging_config import setup_logging, set_correlation_id
 
 # Import rate limiting and metrics
 from backend.utils.rate_limiter import check_rate_limit
@@ -150,6 +150,15 @@ def startup():
     logger.info("Preloading SentenceTransformer embedding model...")
     qdrant_client._load_embed_model()
     logger.info("Embedding model preloaded.")
+    
+    # Preload CrossEncoder reranker so first Copilot query isn't penalized
+    logger.info("Preloading CrossEncoder reranker (ms-marco-MiniLM-L6-v2)...")
+    try:
+        from backend.retrieval.hybrid_retriever import hybrid_retriever
+        hybrid_retriever._load_models()
+        logger.info("CrossEncoder reranker preloaded.")
+    except Exception as e:
+        logger.warning(f"CrossEncoder preload failed (non-fatal): {e}")
 
     # Print startup details to console
     print("\n========================================")
@@ -433,7 +442,8 @@ async def upload_document(
         from celery import chain
         from backend.tasks.ingestion_tasks import (
             validate_task, parse_and_chunk_task, embed_task, extract_entities_task, 
-            extract_relationships_task, graph_upsert_task, quality_validation_task
+            extract_relationships_task, graph_upsert_task, quality_validation_task,
+            precompute_analytics_task
         )
         
         workflow = chain(
@@ -443,7 +453,8 @@ async def upload_document(
             extract_entities_task.s(),
             extract_relationships_task.s(),
             graph_upsert_task.s(),
-            quality_validation_task.s()
+            quality_validation_task.s(),
+            precompute_analytics_task.s()
         )
         workflow.apply_async()
         
@@ -1075,6 +1086,7 @@ def get_all_knowledge_gaps(
             coverage = neo4j_client.compute_knowledge_coverage_score(asset_name, tenant_id)
             risk = neo4j_client.compute_risk_score(asset_name, tenant_id)
             
+            gap["canonical_id"] = gap.get("canonical_id")
             gap["coverage_score"] = coverage.get("coverage_score", 0)
             gap["missing_categories"] = coverage.get("missing_categories", [])
             gap["risk_score"] = risk.get("risk_score", 0)
@@ -1237,7 +1249,6 @@ async def explain_copilot(
     async def sse_generator():
         # Simulated reasoning trace
         import asyncio
-        import random
         
         reasoning_chunks = [
             "I started by parsing the query to identify the target entity: ",

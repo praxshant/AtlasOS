@@ -3,14 +3,11 @@ import os as _sys_os
 import json
 import time as _time
 import redis
-from typing import Dict, Any, List
 
 from backend.tasks.celery_app import celery_app
 from backend.tasks.progress_tracker import progress_tracker
 from backend.db.postgres import SessionLocal, ProcessingJob, Document, Chunk, Entity, AuditLog
 from backend.ingestion.document_processor import process_document
-from backend.ingestion.entity_extractor import extract_entities_batched
-from backend.graph.graph_builder import build_graph_from_extraction
 from backend.graph.neo4j_client import neo4j_client as _neo4j_client
 from backend.vector.qdrant_client import qdrant_client
 from backend.config import get_settings
@@ -176,6 +173,31 @@ def extract_entities_task(self, prev: dict):
         entities = result.get("entities", [])
         all_rels = result.get("relationships", [])
         
+        # --- V2.3 Ontology Validation Pass ---
+        from backend.knowledge_engineering.ontology.validator import validate_relationships
+        all_rels = validate_relationships(all_rels, entities)
+        # -------------------------------------
+        
+        # --- V3 Canonicalization Pass ---
+        from backend.knowledge_engineering.canonicalization.pipeline import resolve_entities_task
+        
+        entities = resolve_entities_task(entities, prev['tenant_id'])
+        
+        # Build a mapping of original_name -> canonical_name, canonical_id
+        canonical_map = {}
+        for ent in entities:
+            for alias in ent.get("aliases", []):
+                canonical_map[alias] = {"cid": ent["canonical_id"], "name": ent["canonical_name"]}
+                
+        for rel in all_rels:
+            if rel["source"] in canonical_map:
+                rel["source_cid"] = canonical_map[rel["source"]]["cid"]
+                rel["source_canonical_name"] = canonical_map[rel["source"]]["name"]
+            if rel["target"] in canonical_map:
+                rel["target_cid"] = canonical_map[rel["target"]]["cid"]
+                rel["target_canonical_name"] = canonical_map[rel["target"]]["name"]
+        # ----------------------------------
+        
         from backend.graph.neo4j_client import neo4j_client as nc
         stats = nc.bulk_upsert(
             tenant_id=prev['tenant_id'],
@@ -245,6 +267,46 @@ def quality_validation_task(self, prev: dict):
         db.add(metrics_record)
         
         job.details = json.dumps(metrics)
+        return prev
+    except Exception as e:
+        db.rollback()
+        if 'job' in locals() and job: job.status = "failed"; job.error = str(e)
+        if 'doc' in locals() and doc: set_status_and_publish(db, doc, "failed", prev['tenant_id'])
+        raise self.retry(exc=e, countdown=5)
+    finally:
+        db.close()
+
+@celery_app.task(bind=True, max_retries=3)
+def precompute_analytics_task(self, prev: dict):
+    if not prev: return None
+    logger.info(f"[DAG] precompute_analytics_task for {prev['job_id']}")
+    db = SessionLocal()
+    try:
+        job, doc = get_job_and_doc(db, prev['job_id'], prev['tenant_id'], prev['document_id'])
+        set_status_and_publish(db, doc, "precomputing_analytics", prev['tenant_id'])
+        
+        from backend.db.postgres import Entity
+        entities = db.query(Entity).filter(Entity.source_doc_id == doc.id).all()
+        
+        for ent in entities:
+            if ent.entity_type in ["Equipment", "Asset"]:
+                try:
+                    _neo4j_client.compute_knowledge_gaps(ent.canonical_name, prev['tenant_id'])
+                except Exception as e:
+                    logger.debug(f"Precompute gap failed for {ent.canonical_name}: {e}")
+            elif ent.entity_type == "Person":
+                try:
+                    _neo4j_client.get_engineer_expertise(ent.canonical_name, prev['tenant_id'])
+                except Exception as e:
+                    logger.debug(f"Precompute expertise failed for {ent.canonical_name}: {e}")
+                    
+        # Also clear tenant cache
+        try:
+            from backend.llm.answer_cache import invalidate_tenant
+            invalidate_tenant(prev['tenant_id'])
+        except Exception as e:
+            logger.debug(f"Cache invalidation skipped: {e}")
+
         job.status = "completed"
         set_status_and_publish(db, doc, "completed", prev['tenant_id'])
         return prev

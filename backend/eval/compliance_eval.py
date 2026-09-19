@@ -18,7 +18,7 @@ def run_compliance_eval(dataset_path: str, tenant_id: str) -> Dict[str, Any]:
     # Normally we would mock the document context retrieval, but since we want to evaluate 
     # the LLM compliance analysis step directly, we will directly call the evaluate_compliance_node
     # in the compliance agent workflow.
-    from backend.agents.compliance_agent import evaluate_compliance_node, ComplianceState
+    from backend.agents.compliance_agent import evaluate_compliance_node
     
     for case in cases:
         doc_text = case["document_text"]

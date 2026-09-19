@@ -1,6 +1,5 @@
 import logging
 import time
-import json
 from typing import List, Dict, Any, Optional
 from neo4j import GraphDatabase
 from backend.config import get_settings
@@ -743,8 +742,13 @@ class Neo4jClient:
         if missing:
             _tid = tenant_id or "default"
             for cat in missing:
+                gap_name = f"{cat} Gap [{equipment_name}]"
+                gap_cid = f"{_tid}:GAP_{cat.upper()}_{equipment_name.upper().replace(' ', '_')}"
+                
                 gap_cypher = """
-                MERGE (gap:MissingCategory {name: $cat, tenant_id: $tenant_id})
+                MERGE (gap:MissingCategory {canonical_id: $gap_cid, tenant_id: $tenant_id})
+                ON CREATE SET gap.name = $gap_name
+                ON MATCH SET gap.name = $gap_name
                 WITH gap
                 MATCH (eq {name: $eq_name, tenant_id: $tenant_id})
                 MERGE (eq)-[g:HAS_KNOWLEDGE_GAP]->(gap)
@@ -752,7 +756,8 @@ class Neo4jClient:
                 """
                 try:
                     self.run_query(gap_cypher, {
-                        "cat": cat,
+                        "gap_cid": gap_cid,
+                        "gap_name": gap_name,
                         "tenant_id": _tid,
                         "eq_name": equipment_name
                     })
@@ -775,14 +780,20 @@ class Neo4jClient:
         Returns knowledge gap reports for ALL equipment / asset nodes
         in the tenant's graph, augmented with risk scores.
         """
-        tenant_filter = "WHERE n.tenant_id = $tenant_id" if tenant_id else ""
+        from backend.config import get_settings
+        settings = get_settings()
+        
+        tenant_filter = "AND n.tenant_id = $tenant_id" if tenant_id else ""
         query = f"""
         MATCH (n)
-        WHERE (n:Asset OR n:Equipment) {('AND n.tenant_id = $tenant_id') if tenant_id else ''}
-        RETURN DISTINCT n.name as name
+        WHERE n.entity_type IN $asset_types {tenant_filter}
+        RETURN DISTINCT n.name as name, n.canonical_id as canonical_id
         LIMIT $limit
         """
-        params: Dict[str, Any] = {"limit": limit}
+        params: Dict[str, Any] = {
+            "limit": limit,
+            "asset_types": settings.ASSET_ENTITY_TYPES
+        }
         if tenant_id:
             params["tenant_id"] = tenant_id
 
@@ -795,8 +806,9 @@ class Neo4jClient:
         results = []
         for row in rows:
             name = row.get("name")
+            canonical_id = row.get("canonical_id")
             if name:
-                asset_dict = {"equipment": name}
+                asset_dict = {"equipment": name, "canonical_id": canonical_id}
                 
                 # Fetch basic gaps using existing logic if needed, but we will overwrite with advanced coverage
                 gap = self.compute_knowledge_gaps(name, tenant_id=tenant_id)
@@ -1170,19 +1182,6 @@ class Neo4jClient:
         RETURN count(n) AS nodes
         '''
 
-        rel_query = '''
-        UNWIND $rels AS r
-        MATCH (a:Entity {tenant_id: $tenant_id, canonical_id: r.source})
-        MATCH (b:Entity {tenant_id: $tenant_id, canonical_id: r.target})
-        WHERE elementId(a) <> elementId(b)
-        MERGE (a)-[rel:REL {rel_type: r.type}]->(b)
-        SET rel.tenant_id = $tenant_id,
-            rel.document_id = r.document_id,
-            rel.confidence = coalesce(r.confidence, 0.7),
-            rel.updated_at = timestamp()
-        RETURN count(rel) AS edges
-        '''
-
         def _tx(tx, ent_batch, rel_batch):
             nodes = 0
             if ent_batch:
@@ -1191,13 +1190,36 @@ class Neo4jClient:
                     entities=ent_batch,
                     tenant_id=tenant_id,
                 ).single()["nodes"]
+                
             edges = 0
             if rel_batch:
-                edges = tx.run(
-                    rel_query,
-                    rels=rel_batch,
-                    tenant_id=tenant_id,
-                ).single()["edges"]
+                # Group relationships by their semantic type to avoid APOC requirement
+                rels_by_type = {}
+                for r in rel_batch:
+                    # Sanitize the type to prevent Cypher injection
+                    from backend.knowledge_engineering.ontology.relationships import normalize_relationship
+                    rtype = normalize_relationship(r.get("type", "RELATED_TO"))
+                    if rtype not in rels_by_type:
+                        rels_by_type[rtype] = []
+                    rels_by_type[rtype].append(r)
+                
+                for rtype, rgroup in rels_by_type.items():
+                    rel_query_dynamic = f'''
+                    UNWIND $rels AS r
+                    MATCH (a:Entity {{tenant_id: $tenant_id, canonical_id: r.source}})
+                    MATCH (b:Entity {{tenant_id: $tenant_id, canonical_id: r.target}})
+                    WHERE elementId(a) <> elementId(b)
+                    MERGE (a)-[rel:{rtype}]->(b)
+                    SET rel.tenant_id = $tenant_id,
+                        rel.document_id = r.document_id,
+                        rel.confidence = coalesce(r.confidence, 0.7),
+                        rel.updated_at = timestamp()
+                    RETURN count(rel) AS edges
+                    '''
+                    res = tx.run(rel_query_dynamic, rels=rgroup, tenant_id=tenant_id)
+                    rec = res.single()
+                    if rec:
+                        edges += rec["edges"]
             return nodes, edges
 
         from backend.config import get_settings
@@ -1267,7 +1289,88 @@ class Neo4jClient:
                 "risk": "High" if not assets else "Low"
             })
         return engineers
+    # --- Phase 7: Confidence Propagation ---
+    def get_relationship_confidences(self, entity_names: List[str], tenant_id: str = None) -> List[float]:
+        if not entity_names:
+            return []
+        tenant_filter = "AND r.tenant_id = $tenant_id" if tenant_id else ""
+        q = f"""
+        MATCH (a)-[r]-(b)
+        WHERE a.name IN $entity_names AND b.name IN $entity_names
+        {tenant_filter}
+        RETURN DISTINCT r.confidence as conf
+        """
+        results = self.run_query(q, {"entity_names": entity_names, "tenant_id": tenant_id})
+        confidences = []
+        for row in results:
+            if row.get("conf") is not None:
+                try:
+                    confidences.append(float(row["conf"]))
+                except ValueError:
+                    pass
+        return confidences
 
+    def aggregate_confidence(self, entity_names: List[str], tenant_id: str = None) -> Dict[str, Any]:
+        """Calculates a principled aggregate confidence using 'weakest link' (minimum) interpretation."""
+        confs = self.get_relationship_confidences(entity_names, tenant_id)
+        if not confs:
+            return {"score": None, "reason": "No graph-backed evidence found"}
+        
+        # We use minimum-of-chain for a "weakest link" interpretation since a reasoning chain is only as strong as its weakest edge.
+        aggregate = min(confs)
+        
+        # Determine reason
+        avg = sum(confs) / len(confs)
+        if len(confs) == 1:
+            reason = "Single-source claim."
+        elif aggregate >= 0.8:
+            reason = "Multiple documents agree strongly."
+        elif avg - aggregate > 0.3:
+            reason = "Chain has a weak link, but mostly solid evidence."
+        else:
+            reason = "Multiple edges with consistent but moderate confidence."
+            
+        return {"score": round(aggregate * 100, 2), "reason": reason}
 
+    # --- Phase 8: Graph Analytics ---
+    def calculate_pagerank(self, tenant_id: str = None) -> List[Dict[str, Any]]:
+        """Surface structurally important entities using basic degree centrality approximation (since GDS might not be installed)."""
+        tenant_filter = "WHERE n.tenant_id = $tenant_id" if tenant_id else ""
+        rel_filter = "WHERE r.tenant_id = $tenant_id" if tenant_id else ""
+        # Approximating PageRank by in-degree to avoid strict GDS requirement
+        q = f"""
+        MATCH (n) {tenant_filter}
+        OPTIONAL MATCH (n)<-[r]-() {rel_filter}
+        WITH n, count(r) as score
+        ORDER BY score DESC
+        LIMIT 10
+        RETURN n.name as name, score
+        """
+        return self.run_query(q, {"tenant_id": tenant_id})
+
+    def calculate_betweenness(self, tenant_id: str = None) -> List[Dict[str, Any]]:
+        """Find bridge entities connecting clusters (approximation via shared neighbors if no GDS)."""
+        tenant_filter = "WHERE n.tenant_id = $tenant_id" if tenant_id else ""
+        q = f"""
+        MATCH (a)-[:RELATED_TO|CAUSED_BY|FAILED_AT|MAINTAINED_BY]-(bridge)-[:RELATED_TO|CAUSED_BY|FAILED_AT|MAINTAINED_BY]-(b)
+        {tenant_filter}
+        WHERE id(a) < id(b)
+        WITH bridge, count(DISTINCT a) * count(DISTINCT b) as approx_betweenness
+        ORDER BY approx_betweenness DESC
+        LIMIT 10
+        RETURN bridge.name as name, approx_betweenness as score
+        """
+        return self.run_query(q, {"tenant_id": tenant_id})
+        
+    def detect_communities(self, tenant_id: str = None) -> List[Dict[str, Any]]:
+        """Group related entities (simple ego-net connected component approx)."""
+        tenant_filter = "WHERE n.tenant_id = $tenant_id" if tenant_id else ""
+        q = f"""
+        MATCH (n) {tenant_filter}
+        OPTIONAL MATCH (n)-[]-(m)
+        RETURN n.name as node, collect(m.name)[0..5] as community
+        LIMIT 20
+        """
+        return self.run_query(q, {"tenant_id": tenant_id})
 
 neo4j_client = Neo4jClient()

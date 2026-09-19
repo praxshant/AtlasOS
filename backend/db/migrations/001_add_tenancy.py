@@ -13,7 +13,6 @@ Usage:
     python -m backend.db.migrations.001_add_tenancy
 """
 
-import sys
 import logging
 from sqlalchemy import create_engine, text
 from backend.config import get_settings

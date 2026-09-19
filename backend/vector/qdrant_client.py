@@ -370,10 +370,10 @@ class QdrantClientWrapper:
             info = client.get_collection(collection_name)
             return {
                 "status": str(info.status),
-                "vectors_count": info.vectors_count,
-                "points_count": info.points_count,
+                "vectors_count": getattr(info, "vectors_count", getattr(info, "indexed_vectors_count", 0)),
+                "points_count": getattr(info, "points_count", 0),
                 "segments_count": len(info.segments) if hasattr(info, 'segments') else 0,
-                "indexed_vectors_count": info.indexed_vectors_count if hasattr(info, 'indexed_vectors_count') else 0,
+                "indexed_vectors_count": getattr(info, "indexed_vectors_count", 0),
             }
         except Exception as e:
             logger.error(f"Failed to check collection health: {e}")

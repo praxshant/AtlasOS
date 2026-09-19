@@ -7,7 +7,7 @@ import subprocess
 # Add project root to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-from backend.db.postgres import SessionLocal, Document, Chunk, Entity, AuditLog, ProcessingJob, User
+from backend.db.postgres import SessionLocal, Document, Chunk, Entity, AuditLog, ProcessingJob
 from backend.graph.neo4j_client import neo4j_client
 from backend.vector.qdrant_client import qdrant_client
 from backend.config import get_settings
@@ -44,9 +44,10 @@ def clean_qdrant():
     try:
         settings = get_settings()
         collection_name = settings.QDRANT_COLLECTION_NAME
-        logger.info(f"Cleaning Qdrant collection: {collection_name}...")
+        logger.info(f"Cleaning Qdrant collection: {collection_name} and 'entities'...")
         client = qdrant_client.get_client()
         client.delete_collection(collection_name)
+        client.delete_collection("entities")
         logger.info("Qdrant cleanup complete.")
     except Exception as e:
         logger.error(f"Qdrant cleanup failed: {e}")

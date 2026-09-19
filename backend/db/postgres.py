@@ -118,7 +118,6 @@ class Entity(Base):
     __table_args__ = (
         Index('ix_entities_tenant_name', 'tenant_id', 'canonical_name'),
         Index('ix_entities_tenant_type', 'tenant_id', 'entity_type'),
-        Index('ix_entities_canonical_name', 'canonical_name'),
     )
 
     id = Column(Integer, primary_key=True, index=True)

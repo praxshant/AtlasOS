@@ -5,7 +5,7 @@ import sys
 # Ensure backend path is in sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from backend.db.postgres import SessionLocal, Tenant, User, Document, ensure_default_tenant
+from backend.db.postgres import SessionLocal, User, Document, ensure_default_tenant
 from backend.vector.qdrant_client import qdrant_client
 from backend.graph.neo4j_client import neo4j_client
 from backend.config import get_settings
@@ -110,8 +110,10 @@ async def seed_demo_data():
     print("Starting AtlasOS Demo Seed Script...")
     
     # 1. Ensure default tenant exists
-    ensure_default_tenant()
-    tenant_id = settings.DEFAULT_TENANT_ID
+    # IMPORTANT: Seed data uses its own tenant, isolated from the real "default" tenant.
+    # This prevents refinery demo nodes from contaminating AeroShield or other live data.
+    tenant_id = "demo_refinery"
+    ensure_default_tenant()  # still ensures "default" Postgres row exists
     
     db = SessionLocal()
     

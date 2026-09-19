@@ -5,7 +5,6 @@ This migration:
 1. Adds `details` column to `processing_jobs` table as JSONB with default '{}'
 """
 
-import sys
 import logging
 from sqlalchemy import create_engine, text
 from backend.config import get_settings

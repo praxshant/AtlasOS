@@ -1,6 +1,5 @@
 import os
 import json
-import uuid
 from datetime import datetime
 
 from backend.eval.retrieval_eval import run_retrieval_eval

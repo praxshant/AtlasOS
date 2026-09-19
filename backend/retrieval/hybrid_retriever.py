@@ -1,9 +1,9 @@
 import logging
 import re
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from rank_bm25 import BM25Okapi
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import CrossEncoder
 
 from backend.db.postgres import SessionLocal, Chunk, Document
 from backend.vector.qdrant_client import qdrant_client
@@ -53,11 +53,18 @@ class HybridRetriever:
             if any(w in q for w in ["how many", "list", "what"]):
                 query_type = "metadata"
             
-        equipment_ids = re.findall(r'\b([A-Z]{1,3}-\d{2,4}[A-Z]?)\b', query)
+        equipment_ids = re.findall(r'\b([A-Z]{1,3}-?\d{1,4}[A-Z]?)\b', query)
         
         # Adaptive Top-K based on complexity
         word_count = len(q.split())
         is_complex = word_count > 10 or len(equipment_ids) > 1
+        
+        # Simple entity lookups that don't need vector search or LLM extraction
+        if word_count < 10 and (
+            len(equipment_ids) > 0 or 
+            any(w in q for w in ["who is", "who owns", "what is", "where is", "tell me about", "who maintains", "who inspected"])
+        ):
+            query_type = "entity_lookup"
         
         initial_k = 30 if is_complex else 20
         rerank_k = 15 if is_complex else 8
